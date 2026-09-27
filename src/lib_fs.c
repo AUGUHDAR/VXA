@@ -277,6 +277,19 @@ static V b_read(Ctx *c, V *args, int nargs) {
   if (!o_str(&x, 1, "grep", "", &grep)) return VN;
   if (!o_nonneg(&x, 1, "ctx", 0, &ctxl)) return VN;
 
+  /* cursor walks a big file in max_bytes-sized pages. It composes with `lines`
+   * rather than duplicating it, and it must not be mixed with an explicit range
+   * because then "what I have already seen" stops being well defined. */
+  int cur = arg_opt_int(&x, 1, "cursor", 0);
+  if (arg_has_err(&x)) return VN;
+  if (cur < 0) { set_error(c, E_BAD_INPUT, "cursor must be >= 0, got %d", cur); return VN; }
+  if (cur > 0) {
+    if (from > 0 || to > 0) {
+      set_error(c, E_BAD_INPUT, "cursor cannot be combined with lines (a cursor IS a line position): use one or the other");
+      return VN;
+    }
+    from = cur; to = 0;
+  }
   Str rp = norm_read(a, s_z(p));
   if (!rp.len) { set_error(c, E_BAD_INPUT, "read: path is empty - %s", err_hint(E_BAD_INPUT)); return VN; }
   ErrCode e = E_NONE;
@@ -286,6 +299,15 @@ static V b_read(Ctx *c, V *args, int nargs) {
   if (r.t != V_REC) { set_error(c, E_IO, "read: no result for '%s'", s_z(p)); return VN; }
   /* echo what the agent typed: absolute paths cost tokens and prove nothing */
   rec_setz(a, r.u.r, "path", v_str(s_lit(a, s_z(p))));
+  V *sh = rec_getz(r.u.r, "shown");
+  /* fs_read_range treats from=0 as "start at line 1", so the next unwritten
+   * line is one past the last shown one in 1-based terms - a cursor that
+   * repeated or skipped a line here would silently corrupt every paginated read */
+  int lo0 = from > 0 ? from - 1 : 0;
+  int next = lo0 + (sh && sh->t == V_NUM ? (int)sh->u.n : 0) + 1;
+  /* next start line, valid whether or not the page was clipped: the agent can
+   * keep reading until cursor >= total instead of having to infer it */
+  rec_setz(a, r.u.r, "cursor", v_num((double)next));
   return r;
 }
 

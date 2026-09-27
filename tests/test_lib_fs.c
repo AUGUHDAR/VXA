@@ -183,6 +183,20 @@ static const char *hint_of(V v) { return (v_is_err(v) && v.u.e) ? v.u.e->hint.p 
 static const char *str_of(V v) { return v.t == V_STR && v.u.s.p ? v.u.s.p : ""; }
 static double num_of(V v, double bad) { return v.t == V_NUM ? v.u.n : bad; }
 static bool bool_of(V v, bool bad) { return v.t == V_BOOL ? v.u.b : bad; }
+/* record field readers that tolerate a missing key, so a wrong key reports as
+ * a failed assertion instead of a null dereference */
+static double fld_n(V o, const char *k, double bad) {
+  V *p = o.t == V_REC ? rec_getz(o.u.r, k) : NULL;
+  return p ? num_of(*p, bad) : bad;
+}
+static bool fld_b(V o, const char *k, bool bad) {
+  V *p = o.t == V_REC ? rec_getz(o.u.r, k) : NULL;
+  return p ? bool_of(*p, bad) : bad;
+}
+static const char *fld_s(V o, const char *k) {
+  V *p = o.t == V_REC ? rec_getz(o.u.r, k) : NULL;
+  return p ? str_of(*p) : "";
+}
 static int len_of(V v) { return v.t == V_LIST && v.u.l ? v.u.l->len : (v.t == V_REC && v.u.r ? v.u.r->len : -1); }
 
 static V *kv(V v, const char *k) { return v.t == V_REC ? rec_getz(v.u.r, k) : NULL; }
@@ -1362,6 +1376,60 @@ int main(void) {
   CKI(code_of(F2v("bundle", v_list(&A, 1, v_strz(&A, "small.c")), v_rec(&A, 1, "max_bytes", v_strz(&A, "9")))), E_TYPE);
   wipe_scratch();
   CK(!fs_exists("doomed.txt") && !fs_exists("new.txt"));
+
+  T("cursor_paging");
+  {
+    Buf tb; buf_init(&tb, &A);
+      for (int i = 1; i <= 60; i++) buf_fmt(&tb, "ln%02d some padding text here %d\n", i, i);
+    Str txt = buf_take(&tb);
+    ErrCode we = E_NONE;
+    fs_write_atomic(C, "pg.txt", txt.p, (size_t)txt.len, false, &we);
+    CKI((int)we, 0);
+
+    Rec *o1 = rec_new(&A);
+    rec_setz(&A, o1, "max_bytes", v_num(200));
+    V a = F2o("read", "pg.txt", rec_to_v(o1));
+    CK(!v_is_err(a));
+    CKI(fld_n(a, "total", -1), 60);
+    CK(fld_b(a, "truncated", false));
+    double c1 = fld_n(a, "cursor", -1);
+    double s1 = fld_n(a, "shown", -1);
+    CK(c1 > 1 && c1 <= 60);
+    CKI((int)(c1 - 1), (int)s1);            /* page 1 showed lines 1..shown */
+
+    Rec *o2 = rec_new(&A);
+    rec_setz(&A, o2, "cursor", v_num(c1));
+    V b = F2o("read", "pg.txt", rec_to_v(o2));
+    CK(!v_is_err(b));
+    CK(!fld_b(b, "truncated", true));
+    double s2 = fld_n(b, "shown", -1);
+    CKI((int)(s1 + s2), 60);               /* full coverage, no overlap */
+    CKS(fld_s(b, "lines"), "7-60");            /* page 1 ended at line 6, so this one starts at 7 */
+    CKI((int)fld_n(b, "cursor", -1), 61);   /* one past the end */
+    const char *bt = fld_s(b, "text");
+    CK(strstr(bt, "ln07") != NULL);      /* resumes exactly where page 1 stopped */
+    CK(strstr(bt, "ln06") == NULL);      /* and does not repeat the last shown line */
+    CK(strstr(fld_s(a, "text"), "ln06") != NULL);
+
+    Rec *o3 = rec_new(&A);
+    rec_setz(&A, o3, "cursor", v_num(1));
+    V whole = F2o("read", "pg.txt", rec_to_v(o3));
+    CK(!fld_b(whole, "truncated", true));
+    CKI((int)fld_n(whole, "cursor", -1), 61);
+
+    Rec *o4 = rec_new(&A);
+    rec_setz(&A, o4, "cursor", v_num(10));
+    rec_setz(&A, o4, "lines", v_strz(&A, "5-9"));
+    V mix = F2o("read", "pg.txt", rec_to_v(o4));
+    CK(code_of(mix) == E_BAD_INPUT);
+    CK(strstr(msg_of(mix), "cursor cannot be combined with lines") != NULL);
+
+    Rec *o5 = rec_new(&A);
+    rec_setz(&A, o5, "cursor", v_num(-1));
+    V neg = F2o("read", "pg.txt", rec_to_v(o5));
+    CK(code_of(neg) == E_BAD_INPUT);
+    /* fixture lives under the test workspace, cleaned by the harness */
+  }
 
   T_REPORT("lib_fs");
 }
