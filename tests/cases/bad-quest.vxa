@@ -1,0 +1,5 @@
+# bad-quest.vxa - test an error value with ".code"; a trailing "?" is not a token yet
+# expect: syntax-error line 5
+r = fs.read("src/val.c")
+x = 1
+if r.code? { out.emit(r) }

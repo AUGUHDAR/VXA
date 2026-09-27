@@ -1,0 +1,3 @@
+# pipe2.vxa - x | f(a,b) is f(x,a,b): the piped value is ALWAYS arg 0
+# expect: ok
+out.emit({sub:"a,b,c" | tx.subst(",", ";"), join:["1","2"] | tx.join("-"), found:"perr(x)" | tx.find("perr")})

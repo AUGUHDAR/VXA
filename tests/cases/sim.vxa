@@ -1,0 +1,8 @@
+# sim.vxa - ~= is similarity 0..1 (data matching only, never syntax repair)
+# expect: ok
+want = "tx.patch"
+for name in ["tx.patch", "tx.pat", "fs.read"] {
+  s = name ~= want
+  if s > 0.7 { out.kv("close", "{name} {s}") }
+}
+out.emit({exact:"abc" ~= "abc", none:"abc" ~= "xyz"})

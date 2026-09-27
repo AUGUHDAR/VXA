@@ -1,0 +1,7 @@
+# crlf.vxa - a CRLF source lexes and parses like the LF form
+# expect: ok
+x = 1
+if x < 3 {
+  out.emit({a:1,b:2})
+}
+for k, v in {p:1, q:2} { out.kv(k, v) }

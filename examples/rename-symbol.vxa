@@ -1,0 +1,29 @@
+#!/usr/bin/env vxa
+# rename-symbol.vxa - the safe edit: anchors in, plan out, token to apply.
+#   pass 1: vxa run examples/rename-symbol.vxa                       -> PLAN, exit 3
+#   pass 2: vxa run examples/rename-symbol.vxa --confirm <token>     -> applied, exit 0
+# run: skip tx.patch returns ERR UNSUPPORTED (tx_apply_patch has no arena to allocate the result)
+path = cfg.get("target", "src/parse.c")
+from = cfg.get("from", "perr")
+to   = cfg.get("to", "report_err")
+
+r = fs.read(path, {anchors:true, grep:from, ctx:2, max_bytes:20000})
+if r.code { out.die(r) }
+if r.truncated { out.die({code:"BAD_INPUT", hint:"raise max_bytes: the anchors you got are partial"}) }
+
+ops = []
+for h in tx.find(r.text, from) {
+  # at + n address the content, not a line number: an insert upstream cannot shift them
+  ops[ops.len()] = {at:h.at, n:h.n, op:"set", text:h.text | tx.subst(from, to)}
+}
+if ops.len() == 0 { out.die({code:"NOHIT", path:path, needle:from, hash:r.hash}) }
+
+patched = tx.patch(r.text, ops, {path:path})
+if patched.code { out.die(patched) }            # ANCHOR_MISS / ANCHOR_DUP land here
+out.emit({applied:patched.applied, checks:patched.checks})
+
+w = fs.write(path, patched.text)                # replacing an existing file needs a token
+out.emit(w)
+given = cfg.get("confirm", "")
+if given == "" { out.emit(w.apply()) }           # -> !ERR code=NEED_CONFIRM, exit 3
+out.emit(w.apply(given))

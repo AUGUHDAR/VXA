@@ -1,0 +1,8 @@
+# arrow-both.vxa - both spellings of the lambda arrow parse and run
+# expect: ok
+a = x -> x * 2
+b = x => x * 2
+c = (p, q) -> p + q
+d = () -> 0
+e = def(m, n) { m * n }
+out.emit({a:a(3), b:b(3), c:c(1,2), d:d(), e:e(2,3)})

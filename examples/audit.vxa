@@ -1,0 +1,21 @@
+#!/usr/bin/env vxa
+# audit.vxa - survey a tree without paying for file bodies. read-only: no plan, no token, exit 0.
+root = cfg.get("root", ".")
+pat  = cfg.get("glob", "*.c")
+files = fs.ls(root, {recursive:true, glob:pat, max:200})
+wide = []
+bytes = 0
+for f in files {
+  bytes = bytes + f.bytes
+  if f.bytes > 20000 { wide[wide.len()] = {path:f.path, bytes:f.bytes, lines:f.lines} }
+}
+out.emit({dir:root, glob:pat, files:files.len(), bytes:bytes, wide:wide})
+
+# symbols only, never text: one outline call replaces ten reads
+for f in files {
+  o = fs.outline(f.path)
+  if o.code { out.log("skip {f.path}: {o}"); continue }
+  sigs = []
+  for s in o.symbols { sigs[sigs.len()] = "{s.kind}:{s.name}@{s.line}" }
+  out.emit({path:o.path, hash:o.hash, lang:o.lang, n:sigs.len(), symbols:sigs})
+}

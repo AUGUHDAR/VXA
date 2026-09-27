@@ -1,0 +1,11 @@
+# anchor-edit.vxa - read with anchors, patch by anchor, never by line number
+# expect: ok
+# run: skip tx.patch returns ERR UNSUPPORTED (tx_apply_patch has no arena to allocate the result from)
+r = fs.read("src/parse.c", {anchors:true, grep:"perr", ctx:2, max_bytes:2000})
+if r.code { out.die(r) }
+hits = tx.find(r.text, "perr\(")
+ops = []
+for h in hits { ops[ops.len()] = {at:h.at, n:h.n, op:"set", text:h.text | tx.subst("perr\(", "report_err(")} }
+patched = tx.patch(r.text, ops, {path:"src/parse.c"})
+out.emit({applied:patched.applied, checks:patched.checks})
+out.emit(fs.write("src/parse.c", patched.text))

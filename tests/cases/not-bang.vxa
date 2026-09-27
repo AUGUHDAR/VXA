@@ -1,0 +1,4 @@
+# not-bang.vxa - "!" and "not" are the same unary operator; "!=" is comparison
+# expect: ok
+a = true
+out.emit({x:!a, y:not a, z:a != false, w:not not a, v:![].len()})

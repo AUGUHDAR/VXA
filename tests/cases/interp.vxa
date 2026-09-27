@@ -1,0 +1,6 @@
+# interp.vxa - "{expr}" interpolates only inside double quotes
+# expect: ok
+r = fs.read("src/parse.c", {lines:"10-40"})
+out.emit({path:"{r.path}", got:"lines {r.lines} of {r.total}", sum:"{1+2*3}"})
+out.kv("raw", 'no {interp} here')
+out.kv("lit", "a literal brace \{ stays data")

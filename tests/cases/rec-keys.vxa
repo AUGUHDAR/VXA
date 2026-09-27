@@ -1,0 +1,6 @@
+# rec-keys.vxa - a bare key is a literal name, never the variable of that name
+# expect: ok
+k = "dyn"
+m = {k:1, "quoted key":2, n:{deep:[1,2]}}
+out.emit({literal:m.k, quoted:m["quoted key"], byvar:m[k], missing:m.dyn, deep:m.n.deep[1]})
+for key, v in m { out.kv("seen {key}", v) }

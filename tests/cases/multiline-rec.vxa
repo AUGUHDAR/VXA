@@ -1,0 +1,8 @@
+# multiline-rec.vxa - newlines are eaten inside [] (), kept inside {}; trailing commas ok
+# expect: ok
+ops = [
+  {at:"c3f2a1b0", op:"set", text:"int main(void) \{"},
+  {at:"7a1b2c3d", op:"del",},
+]
+plan = {op:"tx.patch", confirm:"jail", files:[{path:"a.c", kind:"modify", bytes:512}], "quoted key":1}
+out.emit({ops:ops.len(), file:plan.files[0].path, k:plan["quoted key"], dropped:plan.token})

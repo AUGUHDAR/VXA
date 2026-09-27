@@ -1,0 +1,20 @@
+#!/usr/bin/env vxa
+# digest.vxa - idempotent first pass: build the plan, print the token, exit.
+# same script + same tree => same canonical plan => the same token. nothing is written.
+paths = fs.glob("*.md", ".")
+rows = ["# digest", "path\tbytes\thash"]
+for p in paths {
+  r = fs.read(p, {lines:"1-12", max_bytes:400})
+  if r.code { out.log("skip {p}: {r}"); continue }
+  cell = "{r.path}\t{r.bytes}b\t{r.hash}\t{r.lines}"
+  if r.truncated { cell = "{cell}\ttruncated(max_bytes=400, total={r.total})" }
+  rows[rows.len()] = cell
+}
+body = rows | tx.join("\n")
+plan = fs.write(cfg.get("out", "build/spec-digest.md"), body)
+out.emit(plan)                                     # op, confirm, token and files[] are in the plan
+out.kv("rows", rows.len())
+# stop here on the first pass: the token is the answer, not the write
+given = cfg.get("confirm", "")
+if given == "" { out.kv("next", "vxa run examples/digest.vxa --confirm <token above>") }
+out.emit(plan.apply(given))

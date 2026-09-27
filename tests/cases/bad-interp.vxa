@@ -1,0 +1,5 @@
+# bad-interp.vxa - an interpolation that never closes
+# expect: lex-error line 4
+x = "ok"
+y = "value is {x
+z = "tail"

@@ -1,0 +1,5 @@
+# bad-sep.vxa - newline or ";" separates statements; whitespace does not
+# expect: syntax-error line 5
+a = 1
+b = 2
+c = 3 d = 4

@@ -1,0 +1,8 @@
+# confirm-plan.vxa - idempotent pass: same script + same inputs => same token, every time
+# expect: ok
+path = cfg.get("target", "build/spec-scratch.txt")
+p = fs.write(path, "written by confirm-plan.vxa\n")
+out.emit(p)
+given = cfg.get("confirm", "")
+if given == "" { out.emit({next:"rerun with --confirm <token above>"}) }
+else { out.emit(p.apply(given)) }

@@ -1,0 +1,20 @@
+#!/usr/bin/env vxa
+# config-bind.vxa - look first, bind second, ask last. never guess a path.
+# an agent cannot answer a prompt, so a missing binding is an ERR plus the --set that fixes it.
+want  = cfg.get("tool", "git")
+probe = sh.ro([want, "status"], {timeout:10})      # 1. look: does the tool answer at all
+out.emit({tool:want, code:probe.code, answered:probe.code == 0})
+if probe.err != null { out.log("stderr: {probe.err}") }
+
+exe = cfg.get("{want}.exe", want)                   # 2. bind: --set wins, else this default
+if exe == "" {                                      # 3. ask: one line, no guessing, then stop
+  out.die({code:"BAD_INPUT", need:"{want}.exe", fix:"--set {want}.exe=C:/path/{want}.exe"})
+}
+cfg.set("{want}.exe", exe)
+cfg.set("{want}.probed", probe.code == 0)
+
+p = cfg.save({path:"build/spec-config.json"})       # persisting is a write: same protocol
+out.emit(p)
+given = cfg.get("confirm", "")
+if given == "" { out.emit(p.apply()) }               # -> !ERR code=NEED_CONFIRM, exit 3
+out.emit(p.apply(given))

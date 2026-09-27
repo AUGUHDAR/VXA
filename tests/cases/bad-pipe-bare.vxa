@@ -1,0 +1,5 @@
+# bad-pipe-bare.vxa - "|" must be followed by a call, not a bare name
+# expect: syntax-error line 5
+p = fs.write("a.txt", "x")
+q = 1
+p | out.emit

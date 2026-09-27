@@ -1,0 +1,5 @@
+# lambda-arrow.vxa - lambdas are values: pass them to .map, .filter, .each
+# expect: ok
+double = x -> x * 2
+l = [1, 2, 3]
+out.emit({d:l.map(double), f:l.filter(x -> x > 1), j:l.map((a) -> a + 1).join(",")})

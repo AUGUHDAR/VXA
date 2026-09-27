@@ -1,0 +1,5 @@
+# bad-reequals.vxa - the similarity operator is "~=" only; "=~" lexes as "=" then a bad char
+# expect: lex-error line 5
+a = 1
+b = 2
+c = a =~ b

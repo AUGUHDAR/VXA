@@ -1,0 +1,5 @@
+# bad-ns-call.vxa - the parser accepts it; the runtime answers with UNDEF, exit 2
+# expect: exit 2 UNDEF
+a = 1
+b = fs.nope("x")
+out.emit(b)

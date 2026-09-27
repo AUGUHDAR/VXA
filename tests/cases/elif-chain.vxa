@@ -1,0 +1,10 @@
+# elif-chain.vxa - elif, not "else if"; a blank line between blocks is fine
+# expect: ok
+def grade(n) {
+  if n >= 90 { return "a" }
+
+  elif n >= 80 { return "b" }
+  elif n >= 60 { return "c" }
+  else { return "f" }
+}
+out.emit({g: grade(95), h: grade(85), i: grade(61), j: grade(3)})

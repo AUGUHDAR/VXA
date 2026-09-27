@@ -1,0 +1,5 @@
+# bad-blocksep.vxa - inside a block too, one statement per line or use ";"
+# expect: syntax-error line 4
+if true {
+  out.emit(1) out.emit(2)
+}

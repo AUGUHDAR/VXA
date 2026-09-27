@@ -1,0 +1,6 @@
+# for-kv.vxa - two names iterate a rec as key,value and a list as index,value
+# expect: ok
+cfg = {fmt:"auto", max_bytes:4000, jail:true}
+for k, v in cfg { out.kv(k, "{v} ({v.type()})") }
+for k in cfg { out.raw("{k}\n") }
+for i, v in ["a", "b"] { out.kv(i, v) }

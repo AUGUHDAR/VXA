@@ -1,0 +1,5 @@
+# bad-defparam.vxa - parameter lists take no trailing comma (call args and lists do)
+# expect: syntax-error line 5
+a = 1
+b = 2
+def f(x,) { x }

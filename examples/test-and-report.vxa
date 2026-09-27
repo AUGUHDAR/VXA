@@ -1,0 +1,16 @@
+#!/usr/bin/env vxa
+# test-and-report.vxa - probe the toolchain, run the suites, echo only the failing tail.
+ver = sh.ro(["git", "status"], {timeout:10})      # read-only whitelist: argv, no shell, no token
+out.emit({code:ver.code, ms:ver.ms, truncated:ver.truncated})
+
+# argv form: "; rm -rf" cannot ride along. the string form asks for a shell and always costs a token.
+cmd = ["bash", "build.sh", "test", "parse"]
+if not sh.allowed(cmd) { out.log("not on the read-only list: this becomes a plan, not a result") }
+p = sh.run(cmd, {cwd:".", timeout:120, tail:20})
+out.emit(p)
+given = cfg.get("confirm", "")
+if given == "" { out.emit(p.apply()) }             # -> !ERR code=NEED_CONFIRM, exit 3
+r = p.apply(given)
+if r.code != null {
+  out.emit({fail:r.code, tail:r.out_tail, truncated:r.truncated, total_bytes:r.total_bytes})
+}

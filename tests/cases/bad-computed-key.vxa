@@ -1,0 +1,5 @@
+# bad-computed-key.vxa - record keys are names, "strings" or numbers: never "{expr}"
+# expect: syntax-error line 5
+k = "dyn"
+m = {k: 1}
+n = {{k}: 1}

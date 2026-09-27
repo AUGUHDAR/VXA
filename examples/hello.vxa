@@ -1,0 +1,4 @@
+#!/usr/bin/env vxa
+# hello.vxa - smallest program: one machine-readable line on stdout, exit 0.
+who = cfg.get("name", "vxa")
+out.emit({ok:true, msg:"hello from {who}", n:1 + 2 * 3})

@@ -1,0 +1,4 @@
+# jail-path.vxa - a write outside the workspace root is refused: exit 4, nothing touched
+# expect: OUTSIDE_JAIL
+p = fs.write("/etc/hostname", "nope\n")
+out.emit(p)

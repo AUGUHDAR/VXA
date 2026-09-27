@@ -1,0 +1,5 @@
+# bad-bang.vxa - a lone "!" has no operand ("!" alone is unary not, so it needs a value)
+# expect: syntax-error line 5
+a = 1
+b = 2
+!

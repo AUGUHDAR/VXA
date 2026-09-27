@@ -1,0 +1,12 @@
+# 构建产物：发布走 GitHub Release，不进版本库
+build/
+*.o
+*.exe
+
+# VXA 自己的运行时状态：确认台账、回收站、临时目录
+.vxa/
+*.vxa.log
+
+# 编辑器/系统
+Thumbs.db
+.DS_Store

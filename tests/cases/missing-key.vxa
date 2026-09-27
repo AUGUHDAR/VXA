@@ -1,0 +1,6 @@
+# missing-key.vxa - an absent record key reads null, not an error
+# expect: ok
+r = fs.read("src/val.c", {lines:"1-5"})
+out.kv("cursor", r.cursor)
+if r.cursor == null { out.kv("absent", "no cursor key: prints as - in compact form") }
+out.emit({given:r.cursor, shown:r.hash, notthere:{a:null}})

@@ -1,0 +1,5 @@
+# apply-no-token.vxa - apply() with no token is the normal first pass
+# expect: exit 3 NEED_CONFIRM
+p = sh.run("git status", {cwd:".", timeout:10})
+out.emit(p)
+out.emit(p.apply())
