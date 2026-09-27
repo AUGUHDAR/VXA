@@ -250,6 +250,146 @@ static int ascending(const int *v, int n) {
 static void set_policy(const char *lvl) { rec_setz(&A, ctx_cfg(C), "policies.fs", v_strz(&A, lvl)); }
 static void clear_policy(void) { rec_del(&A, ctx_cfg(C), s_wrap("policies.fs")); }
 
+/* ---------- exact-byte comparison helpers ----------
+ * The suite's whole point: a text field is compared as LENGTH plus BYTES, never
+ * as "does it contain this". A prefix glued in front of every line keeps every
+ * substring check true, and that is how the L1| bug survived 518 assertions. */
+static Str kstr(V v, const char *k) {                      /* the field as a Str, NUL-safe */
+  V *p = kv(v, k);
+  return (p && p->t == V_STR) ? p->u.s : s_null();
+}
+static bool bytes_are(Str s, const char *lit, size_t n) {
+  return s.len == (int)n && (n == 0 || (s.p && !memcmp(s.p, lit, n)));
+}
+/* how many times a needle occurs in a text field - used to prove a prefix
+ * appears exactly once per line, or exactly zero times */
+static int cntstr(Str h, const char *n) {
+  int c = 0, at = 0;
+  size_t nl = strlen(n);
+  if (!h.p) return 0;
+  while ((at = s_findz(h, n, at)) >= 0) { c++; at += (int)nl; }
+  return c;
+}
+/* s is exactly the C string lit - same bytes, same length, nothing appended */
+#define CKBYTES(field, lit)                                            \
+  do { Str _f = (field); size_t _n = strlen(lit);                      \
+    CHECK(bytes_are(_f, lit, _n), "%s=[%.*s] (len %d) want exactly [%s] (len %u)", \
+      #field, _f.len, _f.p ? _f.p : "", _f.len, lit, (unsigned)_n); } while (0)
+/* the documented prefixes are the ONLY thing that may differ between a read and
+ * the file: count how many lines came back with an "L<n>" in front of them */
+static int prefixed_lines(Str text) {
+  int n = 0, at_line = 1;
+  for (int i = 0; i < text.len; i++) {
+    if (at_line && text.p[i] == 'L' && i + 1 < text.len && text.p[i+1] >= '0' && text.p[i+1] <= '9') n++;
+    at_line = (text.p[i] == '\n');
+  }
+  return n;
+}
+/* the exact bytes of one page.txt line, terminator included */
+static char pgtmp[8192];
+static const char *pgline(int i) {
+  static char rot[24][64];
+  static int k = 0;
+  char *b = rot[k++ % 24];
+  snprintf(b, 64, (i == 10 || i == 11 || i == 50) ? "HIT%d aaaaa bbbbb\n" : "row%d aaaaa bbbbb\n", i);
+  return b;
+}
+/* the bytes page.txt would have to return for these 1-based line numbers, in order */
+static size_t pgkeep(char *dst, size_t dn, const int *idx, int n) {
+  size_t o = 0;
+  dst[0] = 0;
+  for (int i = 0; i < n; i++) {
+    const char *l = pgline(idx[i]);
+    size_t ln = strlen(l);
+    if (o + ln + 1 > dn) break;
+    memcpy(dst + o, l, ln);
+    o += ln;
+    dst[o] = 0;
+  }
+  return o;
+}
+/* the same, for the contiguous range from..to */
+static size_t pgrange(char *dst, size_t dn, int from, int to) {
+  int idx[1024];
+  int n = 0;
+  for (int i = from; i <= to && n < 1024; i++) idx[n++] = i;
+  return pgkeep(dst, dn, idx, n);
+}
+/* Remove exactly the documented anchor prefix "L<n>:<hex>| " from the start of
+ * each line. Anything else - a bare "L1| ", a prefix with a non-hex tail, text
+ * that merely starts with L - is left in place, so junk glued onto a read still
+ * shows up as a difference against the file. */
+static Str strip_anchor_prefixes(Arena *a, Str in) {
+  Buf b;
+  int at_line = 1;
+  buf_init(&b, a);
+  for (int i = 0; i < in.len; ) {
+    if (in.p[i] == 'L' && at_line && i + 1 < in.len && in.p[i+1] >= '0' && in.p[i+1] <= '9') {
+      int j = i + 1;
+      while (j < in.len && in.p[j] >= '0' && in.p[j] <= '9') j++;
+      if (j < in.len && in.p[j] == ':') {
+        int k = j + 1;
+        while (k < in.len && isxdigit((unsigned char)in.p[k])) k++;
+        if (k + 1 < in.len && in.p[k] == '|' && in.p[k + 1] == ' ') i = k + 2;
+      }
+    }
+    if (i >= in.len) break;
+    char ch = in.p[i++];
+    buf_putc(&b, ch);
+    at_line = (ch == '\n');
+  }
+  return buf_take(&b);
+}
+/* Anchors as fs.read is allowed to emit them: "L<line>:<at>| " then the raw line.
+ * Computed here from anchors_of() over the file's own bytes, so the expected
+ * string is derived independently of the code under test. */
+static void expect_anchored(char *dst, size_t dn, const char *file, const int *idx, int n, int *used) {
+  size_t o = 0;
+  dst[0] = 0;
+  size_t fn = 0;
+  ErrCode se = E_NONE;
+  char *data = fs_slurp(&A, file, &fn, &se);
+  int an = 0;
+  ErrCode ae = E_NONE;
+  Anch *T = data ? anchors_of(&A, file, s_wrap(data), &an, &ae) : NULL;
+  *used = (T && ae == E_NONE) ? an : -1;
+  for (int i = 0; i < n && T && idx[i] >= 1 && idx[i] <= an; i++) {
+    const char *l = pgline(idx[i]);
+    int w = snprintf(dst + o, dn - o, "L%d:%s| %s", idx[i], T[idx[i] - 1].at.p, l);
+    if (w < 0 || (size_t)w >= dn - o) break;
+    o += (size_t)w;
+  }
+  dst[o] = 0;
+}
+/* the promise the product is built on: read a file, write back exactly what you
+ * read, and the content fingerprint has not moved. `extra` holds the file's own
+ * bytes so the on-disk result can be compared without trusting fs.hash. */
+static void round_trip(const char *p, const char *tag, const char *extra, size_t en) {
+  char lbl[160];
+  snprintf(lbl, sizeof lbl, "%s>%s", t_cur, tag);
+  t_cur = lbl;
+  V h0 = F1("hash", p);
+  V r = F1("read", p);
+  if (code_of(r) != E_NONE) { CHECK(0, "%s: fs.read returned an error", tag); return; }
+  CHECK(!kb(r, "truncated", true), "%s: the read was clipped, so it cannot round trip", tag);
+  Str t = kstr(r, "text");
+  CHECK(t.len == (int)fs_size(p), "%s: read returned %d bytes of a %ld byte file",
+        tag, t.len, fs_size(p));
+  if (t.len <= 0 || t.len != (int)fs_size(p)) return;
+  V args[2] = { v_strz(&A, p), v_str(t) };
+  V w = F("write", args, 2);
+  if (w.t != V_PLAN) { CHECK(0, "%s: fs.write did not return a plan", tag); return; }
+  V f0 = plan_file(w, 0);
+  CKS(ks(f0, "from"), str_of(h0));                      /* what is on disk now */
+  CKS(ks(f0, "to"), str_of(h0));                        /* what we would put there: the same */
+  V ar = apply(w, tok_of(w));
+  CHECK(code_of(ar) == E_NONE, "%s: apply of the round-trip write failed", tag);
+  CKS(str_of(F1("hash", p)), str_of(h0));                 /* hash before == hash after */
+  CHECK(fs_size(p) == (long)t.len, "%s: the file changed size to %ld", tag, fs_size(p));
+  if (extra) CHECK(rdfile(p) && !memcmp(rdfile(p), extra, en),
+                   "%s: the bytes on disk are no longer the originals", tag);
+}
+
 int main(void) {
   arena_init(&A, 0);
   enter_scratch();
@@ -340,82 +480,447 @@ int main(void) {
   CKI(code_of(F1("read", "../nothing/here.txt")), E_NOENT);  /* NOENT, never OUTSIDE_JAIL */
   wipe_scratch();
 
-  /* ---------------- fs.read paging ---------------- */
-  T("read_paging");
-  mkpaged("page.txt");
-  long pbytes = fs_size("page.txt");
-  CK(pbytes > 4000);
-  V r = F2o("read", "page.txt", v_rec(&A, 1, "lines", v_strz(&A, "10-20")));
-  CK(code_of(r) == E_NONE);
-  CK(!strcmp(ks(r, "path"), "page.txt"));                    /* echoes the asked name */
-  CK(!strcmp(ks(r, "lines"), "10-20"));
-  CKI(kn(r, "total", -1), 500);
-  CKI(kn(r, "shown", -1), 11);                               /* 10-20 is 11 lines */
-  CKI(kn(r, "bytes", -1), pbytes);
-  CK(!kb(r, "truncated", true));                             /* a whole page is not a clip */
-  const char *txt = ks(r, "text");
-  CKI(nlines(txt), 11);
-  CK(!strncmp(txt, "L10| HIT10", 10));                       /* reads always say which line */
-  CK(strstr(txt, "L20| row20") != NULL);
-  CK(is_hex(ks(r, "hash"), 12));
-  CK(kn(r, "est", 0) > 0 && kn(r, "est", 9999) < kn(r, "bytes", 0));
-  CK(has(r, "shown") && has(r, "total") && has(r, "truncated"));
+  /* ---------------- fs.read: the bytes, all of them, only them ---------- */
+  /* SPEC 4.1 sells fs.read as the cheap way to look at a file, and the whole
+   * product rests on "what came back is what is there". A `contains` check is
+   * still true when junk is glued in front of every line - which is exactly how
+   * the "L1| " bug shipped through 518 green assertions. So every option
+   * combination below is compared against bytes built independently here, and
+   * the closing proof is the round trip: read -> write leaves fs.hash unmoved. */
+  T("read_raw_exact_bytes");
+  {
+    /* A file whose own content is full of read-prefix shapes: if the reader ever
+     * re-prefixes, "L1| " appears twice on line 1 and the hashes prove it. */
+    static const char *RAW =
+      "L1| this line already looks like a read prefix\n"
+      "L12:deadbeef| and this one looks like an anchor\n"
+      "needle one\n"
+      "\ttabbed\tmiddle and a trailing space \n"
+      "needle two at the end\n";
+    mkbytes("raw.txt", RAW, strlen(RAW));
+    CKI(fs_size("raw.txt"), (long)strlen(RAW));
 
-  T("read_byte_cap");
-  V c = F2o("read", "page.txt", v_rec(&A, 2, "lines", v_strz(&A, "10-20"), "max_bytes", v_num(200)));
-  CK(code_of(c) == E_NONE);
-  CK(kb(c, "truncated", false));
-  CK((long)strlen(ks(c, "text")) <= 200);
-  CK(kn(c, "shown", 99) < 11 && kn(c, "shown", 0) > 0);
-  CKI(kn(c, "total", -1), 500);                              /* still says the file is 500 long */
-  mkblob("blob.txt", 3000);
-  V big = F2o("read", "blob.txt", v_rec(&A, 1, "lines", v_strz(&A, "1-")));
-  CK(kb(big, "truncated", false));                           /* default 8000 clamp is visible */
-  CK((long)strlen(ks(big, "text")) <= 8000);
-  CK(kn(big, "shown", 0) > 10 && kn(big, "shown", 9999) < 3000);
-  CKI(kn(big, "total", -1), 3000);
-  remove("blob.txt");
+    V r = F1("read", "raw.txt");                        /* no options at all */
+    CK(code_of(r) == E_NONE);
+    CKBYTES(kstr(r, "text"), RAW);                      /* the file, byte for byte */
+    /* a text field the same size as the file cannot have anything glued on:
+     * this fixture's own lines start with "L1| ", so a prefix counter would
+     * count the content and lie about it. Length is the honest check here. */
+    CKI(kstr(r, "text").len, (int)strlen(RAW));
+    CKI(kn(r, "total", -1), 5);
+    CKI(kn(r, "shown", -1), 5);
+    CKI(kn(r, "bytes", -1), (long)strlen(RAW));
+    CK(!strcmp(ks(r, "lines"), "1-5"));
+    CK(!kb(r, "truncated", true));
+    CK(!strcmp(ks(r, "path"), "raw.txt"));
+    CK(!strcmp(ks(r, "hash"), str_of(F1("hash", "raw.txt"))));   /* read and hash agree */
+    CKSTR(hash12(&A, RAW, strlen(RAW)), ks(r, "hash"));          /* and both over the real bytes */
 
-  T("read_grep_ctx");
-  V g = F2o("read", "page.txt", v_rec(&A, 2, "grep", v_strz(&A, "HIT"), "ctx", v_num(1)));
-  CK(code_of(g) == E_NONE);
-  CKI(kn(g, "shown", -1), 7);                                /* {9..12} U {49..51}, 10/11 overlap */
-  int idx[64];
-  int gn = echoed_idx(ks(g, "text"), idx, 64);
-  CKI(gn, 7);
-  CK(ascending(idx, gn));                                    /* no duplicated window lines */
-  CKI(idx[0], 9);
-  CKI(idx[2], 11);
-  CKI(idx[3], 12);
-  CKI(idx[4], 49);
-  CK(strstr(ks(g, "text"), "L11| HIT11") != NULL);
-  CK(strstr(ks(g, "text"), "L12| row12") != NULL);           /* neighbour, not a match */
-  V g0 = F2o("read", "page.txt", v_rec(&A, 1, "grep", v_strz(&A, "HIT")));
-  CKI(kn(g0, "shown", -1), 3);                               /* ctx defaults to 0: matches only */
-  V gcase = F2o("read", "page.txt", v_rec(&A, 1, "grep", v_strz(&A, "hit")));
-  CKI(kn(gcase, "shown", -1), 3);                            /* grep ignores case */
-  V gnone = F2o("read", "page.txt", v_rec(&A, 1, "grep", v_strz(&A, "zzzz")));
-  CKI(kn(gnone, "shown", -1), 0);
-  CK(!kb(gnone, "truncated", true));
+    /* every documented lines: spelling, and the text is exactly those lines */
+    V a = F2o("read", "raw.txt", v_rec(&A, 1, "lines", v_strz(&A, "3-4")));
+    CKBYTES(kstr(a, "text"), "needle one\n\ttabbed\tmiddle and a trailing space \n");
+    CK(!strcmp(ks(a, "lines"), "3-4"));
+    CKI(kn(a, "shown", -1), 2);
+    V n = F2o("read", "raw.txt", v_rec(&A, 1, "lines", v_num(2)));
+    CKBYTES(kstr(n, "text"), "L12:deadbeef| and this one looks like an anchor\n");
+    CK(!strcmp(ks(n, "lines"), "2-2"));
+    V e1 = F2o("read", "raw.txt", v_rec(&A, 1, "lines", v_strz(&A, "4-")));
+    CKBYTES(kstr(e1, "text"), "\ttabbed\tmiddle and a trailing space \nneedle two at the end\n");
+    CK(!strcmp(ks(e1, "lines"), "4-5"));
+    V e2 = F2o("read", "raw.txt", v_rec(&A, 1, "lines", v_strz(&A, "-2")));
+    CKBYTES(kstr(e2, "text"), "L1| this line already looks like a read prefix\n"
+                              "L12:deadbeef| and this one looks like an anchor\n");
+    CK(!strcmp(ks(e2, "lines"), "1-2"));
+    /* a range that runs off the end clamps, and says which lines it really gave */
+    V cl = F2o("read", "raw.txt", v_rec(&A, 1, "lines", v_strz(&A, "4-99")));
+    CKBYTES(kstr(cl, "text"), "\ttabbed\tmiddle and a trailing space \nneedle two at the end\n");
+    CK(!strcmp(ks(cl, "lines"), "4-5"));
+    CKI(kn(cl, "total", -1), 5);
+    /* grep: only the matching lines, matched case-insensitively */
+    V gr = F2o("read", "raw.txt", v_rec(&A, 1, "grep", v_strz(&A, "NEEDLE")));
+    CKBYTES(kstr(gr, "text"), "needle one\nneedle two at the end\n");
+    CKI(kn(gr, "shown", -1), 2);
+    CKI(kn(gr, "total", -1), 5);                        /* the file is still 5 lines long */
+    CK(!strcmp(ks(gr, "lines"), "3-5"));                /* span of what was kept */
+    /* grep + ctx: the neighbours, and no line twice */
+    V gc = F2o("read", "raw.txt", v_rec(&A, 2, "grep", v_strz(&A, "needle"), "ctx", v_num(1)));
+    CKBYTES(kstr(gc, "text"), "L12:deadbeef| and this one looks like an anchor\n"
+                              "needle one\n"
+                              "\ttabbed\tmiddle and a trailing space \n"
+                              "needle two at the end\n");
+    CKI(kn(gc, "shown", -1), 4);
+    /* the window is the file minus line 1: a byte count, not a vibe */
+    CKI(kstr(gc, "text").len, (int)strlen(RAW) -
+        (int)strlen("L1| this line already looks like a read prefix\n"));
+    /* grep that matches everything is the whole file, still unprefixed */
+    V ga = F2o("read", "raw.txt", v_rec(&A, 1, "grep", v_strz(&A, "e")));
+    CKBYTES(kstr(ga, "text"), RAW);
+    /* anchors:false is the default and must be spelled out in the bytes */
+    V nof = F2o("read", "raw.txt", v_rec(&A, 1, "anchors", VF));
+    CKBYTES(kstr(nof, "text"), RAW);
+    CK(kstr(nof, "text").len == kstr(r, "text").len);   /* anchors:false IS the default */
 
-  T("read_anchors");
-  V an = F2o("read", "page.txt", v_rec(&A, 2, "lines", v_strz(&A, "12"), "anchors", VT));
-  CK(code_of(an) == E_NONE);
-  const char *al = ks(an, "text");
-  CK(!strncmp(al, "L12:", 4));                               /* L<n>:<at>| content */
-  const char *bar = strstr(al, "| ");
-  CK(bar != NULL);
-  if (bar) {
-    CK(is_hex(al + 4, (int)(bar - (al + 4))));               /* anchor hash, 8 hex in the core */
-    CK(!strcmp(bar + 2, "row12 aaaaa bbbbb\n"));             /* byte-exact line incl. terminator */
-    CK(bar[1] == ' ');
+    /* the round trip: write back what read gave, and the fingerprint holds */
+    round_trip("raw.txt", "raw", RAW, strlen(RAW));
+    /* and a truncated read must be VISIBLY different in the plan, not silently
+     * equal: writing a clipped text back has to change the hash it reports, or
+     * an agent would sign a destructive plan it believed to be a no-op. */
+    V tr = F2o("read", "raw.txt", v_rec(&A, 1, "max_bytes", v_num(95)));
+    CK(kb(tr, "truncated", false));
+    CKI(kn(tr, "shown", -1), 2);
+    CKBYTES(kstr(tr, "text"), "L1| this line already looks like a read prefix\n"
+                              "L12:deadbeef| and this one looks like an anchor\n");
+    {
+      Str part = kstr(tr, "text");
+      V args[2] = { v_strz(&A, "raw.txt"), v_str(part) };
+      V wp = F("write", args, 2);
+      V f0 = plan_file(wp, 0);
+      CKSTR(hash12(&A, RAW, strlen(RAW)), ks(f0, "from"));
+      CKSTR(hash12(&A, part.p, (size_t)part.len), ks(f0, "to"));
+      CK(strcmp(ks(f0, "from"), ks(f0, "to")) != 0);    /* the loss is on the record */
+      remove("raw.txt.vxatmp");
+    }
+    wipe_scratch();
   }
-  V an2 = F2o("read", "page.txt", v_rec(&A, 2, "lines", v_strz(&A, "10-11"), "anchors", VT));
-  CK(!strncmp(ks(an2, "text"), "L10:", 4));
-  CKI(nlines(ks(an2, "text")), 2);
-  CK(strstr(ks(an2, "text"), "| HIT10") != NULL);
+
+  T("read_preserves_every_byte_of_the_file");
+  {
+    /* CRLF: the \r is a byte of the file, not line-ending markup the reader may
+     * drop. Rewriting it is how a read-then-write diff blows up to "every line
+     * changed" and how an anchor computed on the file stops matching. */
+    static const char *CRLF = "a\r\nb\r\nc\r\n";
+    mkbytes("crlf.txt", CRLF, 9);
+    V c = F1("read", "crlf.txt");
+    CK(code_of(c) == E_NONE);
+    CKBYTES(kstr(c, "text"), CRLF);
+    CKI(kn(c, "total", -1), 3);
+    CKI(kn(c, "shown", -1), 3);
+    /* fs.read reports bytes/lines/truncated, not an eol verdict: that is
+     * fs.check's job, and a reader that "fixed" the endings would disagree
+     * with fs.check's byte count. */
+    CK(!has(c, "eol"));
+    CKI(kn(c, "bytes", -1), 9);
+    CKS(ks(c, "hash"), str_of(F1("hash", "crlf.txt")));
+    CK(!strcmp(ks(F1("check", "crlf.txt"), "eol"), "crlf"));   /* the file really is CRLF */
+    round_trip("crlf.txt", "crlf", CRLF, 9);
+
+    /* a file that does not end in a line break: no newline may be invented */
+    static const char *UNTERM = "a\nb";
+    mkbytes("unterm.txt", UNTERM, 3);
+    V u = F1("read", "unterm.txt");
+    CKBYTES(kstr(u, "text"), UNTERM);
+    CKI(kstr(u, "text").len, 3);
+    CKI(kn(u, "total", -1), 2);
+    CKI(kn(u, "shown", -1), 2);
+    CK(!strcmp(ks(u, "lines"), "1-2"));
+    round_trip("unterm.txt", "unterminated", UNTERM, 3);
+    /* a page in the middle of it keeps the real terminators too */
+    V u2 = F2o("read", "unterm.txt", v_rec(&A, 1, "lines", v_strz(&A, "2")));
+    CKBYTES(kstr(u2, "text"), "b");
+
+    /* a lone \r is an old-Mac break: two lines, and every byte survives */
+    static const char CRONLY[] = { 'x', '\r', 'y', '\r' };
+    mkbytes("cr.txt", CRONLY, sizeof CRONLY);
+    V cr = F1("read", "cr.txt");
+    CHECK(bytes_are(kstr(cr, "text"), CRONLY, sizeof CRONLY),
+          "a lone CR must come back as CR, not as a rewritten LF");
+    CKI(kn(cr, "total", -1), 2);
+    CKI(kn(cr, "shown", -1), 2);
+    round_trip("cr.txt", "lone CR", CRONLY, sizeof CRONLY);
+
+    /* trailing blank lines are content, not padding */
+    static const char *BLANK = "a\n\n";
+    mkbytes("blank.txt", BLANK, 3);
+    V bl = F1("read", "blank.txt");
+    CKBYTES(kstr(bl, "text"), BLANK);
+    CKI(kn(bl, "total", -1), 2);
+    CKI(kn(bl, "shown", -1), 2);
+    round_trip("blank.txt", "trailing blank", BLANK, 3);
+
+    /* NUL is a byte. fs.read must not stop at it - the record carries a length. */
+    static const char NULS[] = { 'a', 0, 'b', '\n' };
+    mkbytes("nul.txt", NULS, sizeof NULS);
+    V z = F1("read", "nul.txt");
+    CK(code_of(z) == E_NONE);
+    /* CKBYTES measures the literal with strlen, so a byte string is compared
+     * against the buffer it came from instead */
+    CHECK(bytes_are(kstr(z, "text"), NULS, sizeof NULS),
+          "fs.read stopped early: got %d bytes of a 4 byte file", kstr(z, "text").len);
+    CKI(kstr(z, "text").len, 4);
+    CKI(kn(z, "total", -1), 1);
+    CKI(kn(z, "bytes", -1), 4);
+    round_trip("nul.txt", "embedded NUL", NULS, sizeof NULS);
+
+    /* an empty file reads as empty text, not as one blank line */
+    mkbytes("zero.txt", "", 0);
+    V ze = F1("read", "zero.txt");
+    CK(code_of(ze) == E_NONE);
+    CKI(kstr(ze, "text").len, 0);
+    CKI(kn(ze, "total", -1), 0);
+    CKI(kn(ze, "shown", -1), 0);
+    CK(!strcmp(ks(ze, "hash"), str_of(F1("hash", "zero.txt"))));
+    round_trip("zero.txt", "empty", "", 0);
+    wipe_scratch();
+  }
+
+  T("read_byte_budget_is_exact_and_never_partial");
+  {
+    mkpaged("page.txt");
+    long pbytes = fs_size("page.txt");
+    CKI(pbytes, 9392);
+    char want[8192];
+    /* 11 lines, 10..20, every one of them 18 bytes -> 198 */
+    size_t wn = pgrange(want, sizeof want, 10, 20);
+    CKI((long)wn, 198);
+    V r = F2o("read", "page.txt", v_rec(&A, 1, "lines", v_strz(&A, "10-20")));
+    CK(code_of(r) == E_NONE);
+    CK(!strcmp(ks(r, "path"), "page.txt"));             /* echoes the asked name */
+    CKBYTES(kstr(r, "text"), want);                     /* the whole page, exact */
+    CKI(kstr(r, "text").len, 198);
+    CKI(nlines(want), 11);
+    CKI(kn(r, "total", -1), 500);
+    CKI(kn(r, "shown", -1), 11);
+    CKI(kn(r, "bytes", -1), pbytes);
+    CK(!kb(r, "truncated", true));                      /* a whole page is not a clip */
+    {
+      int probe[64];
+      CKI(echoed_idx(ks(r, "text"), probe, 64), 0);     /* no line number was echoed */
+    }
+    CK(is_hex(ks(r, "hash"), 12));
+    CKI(kn(r, "est", -1), (198 + 3) / 4);               /* est is ceil(bytes/4), exactly */
+    CK(has(r, "shown") && has(r, "total") && has(r, "truncated"));
+
+    /* max_bytes clips at a whole-line boundary and says so */
+    V c = F2o("read", "page.txt", v_rec(&A, 2, "lines", v_strz(&A, "10-"), "max_bytes", v_num(200)));
+    CK(code_of(c) == E_NONE);
+    CK(kb(c, "truncated", false));
+    /* lines 10..20 are 198 bytes; line 21 would make 216 > 200, so it stops clean */
+    pgrange(want, sizeof want, 10, 20);
+    CKBYTES(kstr(c, "text"), want);
+    CKI(kstr(c, "text").len, 198);
+    CKI(kn(c, "shown", -1), 11);
+    CKI(kn(c, "total", -1), 500);
+    CKI(kn(c, "bytes", -1), pbytes);
+    /* one byte less and a whole line has to go - the boundary is line-granular */
+    V c2 = F2o("read", "page.txt", v_rec(&A, 2, "lines", v_strz(&A, "10-"), "max_bytes", v_num(188)));
+    CK(kb(c2, "truncated", false));
+    pgrange(want, sizeof want, 10, 19);
+    CKBYTES(kstr(c2, "text"), want);
+    CKI(kn(c2, "shown", -1), 10);
+    CKI(kstr(c2, "text").len, 180);                     /* 10 lines x 18 B */
+    /* a budget smaller than the first line hides everything, and must admit it */
+    V c3 = F2o("read", "page.txt", v_rec(&A, 2, "lines", v_strz(&A, "10-20"), "max_bytes", v_num(3)));
+    CK(kb(c3, "truncated", false));
+    CKI(kstr(c3, "text").len, 0);
+    CKI(kn(c3, "shown", -1), 0);
+    CK(!strcmp(ks(c3, "lines"), "0-0"));                /* it never claims to have shown 10-20 */
+    /* the default clamp: 8000 bytes of a 9392 byte file, whole lines only */
+    V d = F1("read", "page.txt");
+    CK(kb(d, "truncated", false));
+    CK((long)strlen(ks(d, "text")) <= 8000);
+    CKI(kn(d, "shown", -1), 426);                       /* line 427 would cross 8000 */
+    CKI((long)strlen(ks(d, "text")), 1773 + 327 * 19);
+    CKI(kn(d, "total", -1), 500);
+    CKI(kn(d, "bytes", -1), pbytes);
+    CK(!strcmp(ks(d, "lines"), "1-426"));               /* the span it actually covers */
+    /* max_tok prices bytes at the language's own 4-per-token rate: 10 tok = 40 B,
+     * which is two 17-byte lines plus a separator, never a third */
+    V bt = F2o("read", "page.txt", v_rec(&A, 1, "max_tok", v_num(10)));
+    pgrange(want, sizeof want, 1, 2);
+    CKBYTES(kstr(bt, "text"), want);
+    CKI(kn(bt, "shown", -1), 2);                        /* 34 B of the 40 B budget */
+    CKI(kstr(bt, "text").len, 34);
+    /* max_bytes wins over max_tok when both are given */
+    V both = F2o("read", "page.txt", v_rec(&A, 2, "max_tok", v_num(10), "max_bytes", v_num(200)));
+    pgrange(want, sizeof want, 1, 11);
+    CKBYTES(kstr(both, "text"), want);
+    CKI(kstr(both, "text").len, 189);                   /* 9x17 + 2x18; line 12 would make 206 */
+    CKI(kn(both, "shown", -1), 11);
+    mkblob("blob.txt", 3000);
+    V big = F2o("read", "blob.txt", v_rec(&A, 1, "lines", v_strz(&A, "1-")));
+    CK(kb(big, "truncated", false));
+    CKI(kstr(big, "text").len, 30 * 266);               /* every line is 30 B; 267 would be 8010 */
+    CK((long)strlen(ks(big, "text")) <= 8000);
+    CKI(kn(big, "shown", -1), 266);
+    CKI(kn(big, "total", -1), 3000);
+    CK(!strcmp(ks(big, "lines"), "1-266"));
+    remove("blob.txt");
+    remove("page.txt");
+    wipe_scratch();
+  }
+
+  T("read_grep_ctx_windows");
+  {
+    mkpaged("page.txt");
+    char want[8192];
+    const int KEEP[] = { 9, 10, 11, 12, 49, 50, 51 };
+    const int KEEP0[] = { 10, 11, 50 };
+    V g = F2o("read", "page.txt", v_rec(&A, 2, "grep", v_strz(&A, "HIT"), "ctx", v_num(1)));
+    CK(code_of(g) == E_NONE);
+    CKI(kn(g, "shown", -1), 7);                         /* {9..12} U {49..51}, 10/11 overlap */
+    pgkeep(want, sizeof want, KEEP, 7);
+    {
+      CKBYTES(kstr(g, "text"), want);                   /* exactly these 7 lines, in order */
+      /* the windows did not duplicate a line and did not merge into one blob */
+      CKI(nlines(want), 7);
+      CK(s_findz(kstr(g, "text"), "row13 ", 0) < 0);    /* line 13 is not in the window */
+      CK(s_findz(kstr(g, "text"), "row48 ", 0) < 0);
+      CK(s_findz(kstr(g, "text"), "row52 ", 0) < 0);
+      CKI(cntstr(kstr(g, "text"), "HIT10"), 1);         /* the overlap kept it once */
+      CKI(cntstr(kstr(g, "text"), "row11"), 0);         /* line 11 is a HIT line, not a row */
+      CKI(prefixed_lines(kstr(g, "text")), 0);
+    }
+    /* ctx:0 (the default) is the matches alone - proof the ctx knob is wired */
+    V g0 = F2o("read", "page.txt", v_rec(&A, 1, "grep", v_strz(&A, "HIT")));
+    pgkeep(want, sizeof want, KEEP0, 3);
+    CKBYTES(kstr(g0, "text"), want);
+    CKI(kn(g0, "shown", -1), 3);
+    V g2 = F2o("read", "page.txt", v_rec(&A, 2, "grep", v_strz(&A, "HIT"), "ctx", v_num(2)));
+    {
+      static const int K2[] = { 8, 9, 10, 11, 12, 13, 48, 49, 50, 51, 52 };
+      pgkeep(want, sizeof want, K2, 11);
+      CKBYTES(kstr(g2, "text"), want);
+      CKI(kn(g2, "shown", -1), 11);                     /* {8..13} U {48..52}, no overlap */
+    }
+    V gcase = F2o("read", "page.txt", v_rec(&A, 1, "grep", v_strz(&A, "hit")));
+    pgkeep(want, sizeof want, KEEP0, 3);
+    CKBYTES(kstr(gcase, "text"), want);
+    CKI(kn(gcase, "shown", -1), 3);                     /* grep ignores case */
+    V gnone = F2o("read", "page.txt", v_rec(&A, 1, "grep", v_strz(&A, "zzzz")));
+    CKI(kn(gnone, "shown", -1), 0);
+    CKI(kstr(gnone, "text").len, 0);                    /* an empty answer is empty bytes */
+    CK(!kb(gnone, "truncated", true));
+    CK(!strcmp(ks(gnone, "lines"), "0-0"));
+    /* a grep term that is itself a read prefix must match content, not markup */
+    V gp = F2o("read", "page.txt", v_rec(&A, 1, "grep", v_strz(&A, "L10|")));
+    CKI(kn(gp, "shown", -1), 0);
+    remove("page.txt");
+  }
+
+  T("read_anchors_are_the_documented_prefix_and_nothing_else");
+  {
+    mkpaged("page.txt");
+    char want[8192];
+    int used = 0;
+    const int ONE[] = { 12 };
+    V an = F2o("read", "page.txt", v_rec(&A, 2, "lines", v_strz(&A, "12"), "anchors", VT));
+    CK(code_of(an) == E_NONE);
+    /* the whole prefix format, computed from anchors_of over the file's bytes */
+    expect_anchored(want, sizeof want, "page.txt", ONE, 1, &used);
+    CKI(used, 500);
+    CKBYTES(kstr(an, "text"), want);
+    {
+      Str t = kstr(an, "text");
+      CK(!strncmp(t.p, "L12:", 4));                     /* L<n>:<at>| content */
+      const char *bar = strstr(ks(an, "text"), "| ");
+      CK(bar != NULL);
+      if (bar) {
+        CKI((int)(bar - t.p), 4 + 8);                   /* "L12:" + the 8-hex anchor */
+        CK(is_hex(t.p + 4, 8));
+        CK(!strcmp(bar + 2, "row12 aaaaa bbbbb\n"));    /* byte-exact line after the prefix */
+        CK(bar[1] == ' ');
+      }
+      /* anchors add exactly the prefix, never a second copy of the line */
+      CKI(nlines(ks(an, "text")), 1);
+      CKI(kn(an, "shown", -1), 1);
+      CKI(kn(an, "total", -1), 500);
+      /* and the hash still describes the file, not the decorated text */
+      CK(!strcmp(ks(an, "hash"), str_of(F1("hash", "page.txt"))));
+    }
+    const int TWO[] = { 10, 11 };
+    V an2 = F2o("read", "page.txt", v_rec(&A, 2, "lines", v_strz(&A, "10-11"), "anchors", VT));
+    expect_anchored(want, sizeof want, "page.txt", TWO, 2, &used);
+    CKBYTES(kstr(an2, "text"), want);
+    CKI(nlines(ks(an2, "text")), 2);
+    /* each anchor line is distinct and carries its own line number */
+    {
+      int idx[8];
+      int en = echoed_idx(ks(an2, "text"), idx, 8);
+      CKI(en, 2);
+      CKI(idx[0], 10);
+      CKI(idx[1], 11);
+      CK(ascending(idx, en));
+    }
+    /* anchors over a grep window: the prefixes carry the file's real numbers,
+     * not 1..n of what happened to be shown */
+    V ag = F2o("read", "page.txt", v_rec(&A, 3, "grep", v_strz(&A, "HIT"), "ctx", v_num(1),
+                                         "anchors", VT));
+    CK(code_of(ag) == E_NONE);
+    {
+      static const int K7[] = { 9, 10, 11, 12, 49, 50, 51 };
+      int idx[16];
+      expect_anchored(want, sizeof want, "page.txt", K7, 7, &used);
+      CKBYTES(kstr(ag, "text"), want);
+      CKI(nlines(want), 7);
+      int en = echoed_idx(want, idx, 16);
+      CKI(en, 7);
+      CKI(idx[0], 9);
+      CKI(idx[3], 12);
+      CKI(idx[4], 49);
+      CK(ascending(idx, en));
+    }
+    /* THE round trip that makes anchors worth their prefix: an anchor lifted out
+     * of a read must resolve in a patch over the same file. If fs.read and
+     * anchors_of ever disagree about how the file splits, this is where it shows. */
+    {
+      Str t = kstr(an, "text");                         /* "L12:<at>| row12 aaaaa bbbbb\n" */
+      const char *bar = t.p ? strstr(t.p, "| ") : NULL;
+      CK(bar != NULL);
+      if (bar) {
+        char at[9];
+        memcpy(at, t.p + 4, 8);
+        at[8] = 0;
+        CK(is_hex(at, 8));
+        size_t fn = 0;
+        ErrCode se = E_NONE;
+        char *data = fs_slurp(&A, "page.txt", &fn, &se);
+        CK(data != NULL);
+        V ops = v_list(&A, 1, v_ok(&A, 3, "at", v_strz(&A, at), "op", v_strz(&A, "set"),
+                                   "text", v_strz(&A, "PATCHED BY THE ANCHOR FROM THE READ")));
+        V pr = tx_patch_apply(&A, s_wrap(data), "page.txt", ops);
+        CK(pr.t == V_REC);
+        if (pr.t == V_REC) {
+          Str out = kstr(pr, "text");
+          CK(out.len > 0);
+          CK(s_findz(out, "PATCHED BY THE ANCHOR FROM THE READ", 0) >= 0);
+          CK(s_findz(out, "row12 aaaaa bbbbb", 0) < 0);  /* that exact line is what moved */
+          CKI(s_count_char(out, '\n'), 500);             /* one edit, no lines gained or lost */
+          CKI((long)kn(pr, "applied", -1), 1);
+        }
+      }
+    }
+    remove("page.txt");
+    wipe_scratch();
+  }
+
+  /* An anchor table that does not cover every line is a silent lie: fs.read must
+   * refuse rather than emit bare "L12| " numbers an agent would copy into a
+   * patch and get ANCHOR_MISS for. */
+  T("read_anchors_refuse_a_partial_table");
+  {
+    static const char *FIVE[] = { "one", "two", "", "four", "" };
+    char src[64];
+    size_t o = 0;
+    src[0] = 0;
+    for (int i = 0; i < 5; i++) o += (size_t)snprintf(src + o, sizeof src - o, "%s\n", FIVE[i]);
+    mkbytes("anc.txt", src, o);
+    V q = F2o("read", "anc.txt", v_rec(&A, 1, "anchors", VT));
+    CK(code_of(q) == E_NONE);                           /* the table covers what the read split */
+    CKI(kn(q, "total", -1), 5);
+    CKI(kn(q, "shown", -1), 5);
+    CKI(prefixed_lines(kstr(q, "text")), 5);            /* every line carries L<n>:<at>| */
+    CKI(cntstr(kstr(q, "text"), "| "), 5);
+    /* the whole contract in one line: take the documented prefixes away and the
+     * file's bytes are what remains - 5 lines, the last two of them blank */
+    CKBYTES(strip_anchor_prefixes(&A, kstr(q, "text")), src);
+    /* and the anchors handed out are 8 hex and pairwise recomputable */
+    CKI(kn(q, "bytes", -1), (long)o);
+    round_trip("anc.txt", "anchors were not written back", src, o);
+    wipe_scratch();
+  }
 
   T("read_errors_and_ranges");
+  mkpaged("page.txt");
   CKI(code_of(F1("read", "gone.txt")), E_NOENT);
   CKI(code_of(F1("read", ".")), E_ISDIR);
   CKI(code_of(F2o("read", "page.txt", v_rec(&A, 1, "lines", v_strz(&A, "abc")))), E_BAD_INPUT);
@@ -428,14 +933,28 @@ int main(void) {
   V one = F2o("read", "page.txt", v_rec(&A, 1, "lines", v_num(500)));
   CKI(kn(one, "shown", -1), 1);
   CK(!strcmp(ks(one, "lines"), "500-500"));
+  CKBYTES(kstr(one, "text"), "row500 aaaaa bbbbb\n");   /* the last line, and only it */
   V head = F2o("read", "page.txt", v_rec(&A, 2, "lines", v_strz(&A, "-3"), "max_bytes", v_num(4000)));
   CKI(kn(head, "shown", -1), 3);
-  /* 9 bytes: the echoed number, the content, and the separator after it */
-  CK(!strncmp(ks(head, "text"), "L1| row1 ", 9));
-  V bt = F2o("read", "page.txt", v_rec(&A, 1, "max_tok", v_num(10)));
-  CK((long)strlen(ks(bt, "text")) <= 40);                   /* max_tok prices bytes at 4/token */
-  V both = F2o("read", "page.txt", v_rec(&A, 2, "max_tok", v_num(10), "max_bytes", v_num(200)));
-  CK((long)strlen(ks(both, "text")) <= 200);                /* max_bytes wins over max_tok */
+  CKBYTES(kstr(head, "text"), "row1 aaaaa bbbbb\nrow2 aaaaa bbbbb\nrow3 aaaaa bbbbb\n");
+  /* a page past the end of the file is empty, and says so instead of clamping */
+  V over = F2o("read", "page.txt", v_rec(&A, 1, "lines", v_strz(&A, "600-700")));
+  CK(code_of(over) == E_NONE);
+  CKI(kstr(over, "text").len, 0);
+  CKI(kn(over, "shown", -1), 0);
+  CKI(kn(over, "total", -1), 500);
+  /* max_tok prices bytes at the language's own 4 B/token and never emits a
+   * partial line: 5 tok = 20 B buys one 17-byte line and stops before the next */
+  V bt2 = F2o("read", "page.txt", v_rec(&A, 2, "lines", v_strz(&A, "-3"), "max_tok", v_num(5)));
+  CKBYTES(kstr(bt2, "text"), "row1 aaaaa bbbbb\n");
+  CKI(kn(bt2, "shown", -1), 1);
+  CK(kb(bt2, "truncated", false));
+  CK(!strcmp(ks(bt2, "lines"), "1-1"));                 /* not the "1-3" that was asked for */
+  /* max_bytes wins over max_tok: 200 B buys 11 lines, the 40 B max_tok would buy 2 */
+  V both = F2o("read", "page.txt", v_rec(&A, 3, "lines", v_strz(&A, "-20"), "max_tok", v_num(10),
+                                         "max_bytes", v_num(200)));
+  CKBYTES(kstr(both, "text"), (pgrange(pgtmp, sizeof pgtmp, 1, 11), pgtmp));
+  CKI(kn(both, "shown", -1), 11);
   remove("page.txt");
 
   /* ---------------- fs.check ---------------- */

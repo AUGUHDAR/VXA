@@ -32,18 +32,41 @@
 #define TRASH_KEEP_DAYS 30
 #define READ_CAP (4u * 1024u * 1024u)
 
-static void split_lines(Arena *a, Str t, Str *l, int *n, int max) {
-  int start = 0, k = 0;
-  for (int i = 0; i <= t.len && k < max; i++) {
-    bool brk = (i == t.len) || t.p[i] == '\n' || t.p[i] == '\r';
-    if (!brk) continue;
-    int end = i;
-    if (t.p[i] == '\r' && i + 1 < t.len && t.p[i+1] == '\n') i++;
-    if (i == t.len && end == start) break;         /* no trailing empty line */
-    l[k++] = s_slice(t, start, end);
-    start = i + 1;
+/* Line splitting that loses bytes is a lie of the same shape as a glued-on
+ * prefix: fs.read(p).text has to be re-writable as p. So a line remembers how
+ * it was ended in the file, and the reader puts those exact bytes back. The
+ * rules mirror xdiff.c's split_raw so the two never disagree about how many
+ * lines a file has - fs.read(anchors:true) checks that and refuses otherwise. */
+enum { BRK_NONE = 0, BRK_LF = 1, BRK_CRLF = 2, BRK_CR = 3 };
+
+static int split_lines(Arena *a, Str t, Str *l, unsigned char *brk, int *n, int max) {
+  int k = 0, i = 0;
+  while (i < t.len && k < max) {
+    int j = i;
+    while (j < t.len && t.p[j] != '\n' && t.p[j] != '\r') j++;
+    l[k] = s_slice(t, i, j);
+    if (brk) brk[k] = BRK_NONE;
+    if (j < t.len) {
+      if (t.p[j] == '\r' && j + 1 < t.len && t.p[j + 1] == '\n') {
+        if (brk) brk[k] = BRK_CRLF;
+        j += 2;
+      } else {
+        if (brk) brk[k] = (t.p[j] == '\r') ? BRK_CR : BRK_LF;
+        j += 1;
+      }
+    }
+    k++;
+    i = j;
   }
   *n = k;
+  return k;
+}
+
+static int brk_len(unsigned char k) { return k == BRK_CRLF ? 2 : (k ? 1 : 0); }
+static void brk_put(Buf *b, unsigned char k) {
+  if (k == BRK_LF) buf_putc(b, '\n');
+  else if (k == BRK_CRLF) buf_puts(b, "\r\n");
+  else if (k == BRK_CR) buf_putc(b, '\r');
 }
 
 bool fs_exists(const char *p) { struct stat st; return p && !stat(p, &st); }
@@ -265,11 +288,17 @@ V fs_read_range(Ctx *c, const char *path, int from, int to, const char *grep,
   ErrCode se = E_NONE;
   char *data = fs_slurp(a, path, &n, &se);
   if (!data) { *err = se; return VN; }
-  Str text = s_wrap(data);
+  /* the length comes from the file, never from strlen: a NUL is a byte of the
+   * content, and a read that stopped at one would report the whole file's size
+   * alongside half of its bytes and truncated=false */
+  Str text;
+  text.p = data;
+  text.len = (int)n;
   int cap = 200000;
   Str *lines = (Str*)arena_zalloc(a, sizeof(Str) * (size_t)cap);
+  unsigned char *brk = (unsigned char*)arena_zalloc(a, (size_t)cap);
   int nl = 0;
-  split_lines(a, text, lines, &nl, cap);
+  split_lines(a, text, lines, brk, &nl, cap);
   int total_bytes = (int)n;
   int total_lines = nl;
 
@@ -301,6 +330,7 @@ V fs_read_range(Ctx *c, const char *path, int from, int to, const char *grep,
 
   Buf b; buf_init(&b, a);
   int emitted = 0, bytes = 0;
+  int first = -1, last = -1;
   bool truncated = false;
   for (int i = 0; i < nkeep; i++) {
     int idx = keep[i];
@@ -313,19 +343,24 @@ V fs_read_range(Ctx *c, const char *path, int from, int to, const char *grep,
       if (acount != nl) { *err = E_INTERNAL; set_error(c, E_INTERNAL, "fs.read(%s): anchor table has %d entries for %d lines; refusing to emit partial anchors", path, acount, nl); return VN; }
       snprintf(pre, sizeof pre, "L%d:%s| ", idx + 1, A[idx].at.p);
     }
-    int need = (int)strlen(pre) + l.len + 1;
+    int bk = brk_len(brk[idx]);
+    int need = (int)strlen(pre) + l.len + bk;
     if (max_bytes > 0 && bytes + need > max_bytes) { truncated = true; break; }
     buf_puts(&b, pre);
     buf_put(&b, l.p, (size_t)l.len);
-    buf_putc(&b, '\n');
+    brk_put(&b, brk[idx]);
     bytes += need;
+    if (first < 0) first = idx;
+    last = idx;
     emitted++;
   }
   Str out = buf_take(&b);
   ErrCode he = E_NONE;
   Str h = hash12(a, data, n);
   (void)he;
-  int lo = nkeep ? keep[0] + 1 : 0, hi = nkeep ? keep[nkeep-1] + 1 : 0;
+  /* `lines` describes THIS text. Claiming the range that was asked for while
+   * the byte budget hid the tail is a partial read dressed up as a whole one. */
+  int lo = emitted ? first + 1 : 0, hi = emitted ? last + 1 : 0;
   return v_ok(a, 9,
     "path", v_str(s_lit(a, path)),
     "hash", v_str(h),

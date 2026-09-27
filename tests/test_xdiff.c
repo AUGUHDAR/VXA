@@ -44,6 +44,27 @@ static bool is_hex(Str s) {
   }
   return true;
 }
+/* Whole-text equality. `inStr` on a patch result proves a fragment survived, not
+ * that nothing else changed - a duplicated line, a lost trailing break or a
+ * re-written line ending all pass it. Every patched file below is spelled out
+ * in full for the same reason fs.read is. */
+#define CKEQ(a, lit)                                                    \
+  do { Str _x = (a); const char *_y = (lit); size_t _n = strlen(_y);     \
+    CHECK(_x.len == (int)_n && (_n == 0 || (_x.p && !memcmp(_x.p, _y, _n))), \
+          "got [%.*s] (len %d) want [%s] (len %u)", _x.len, _x.p ? _x.p : "", \
+          _x.len, lit, (unsigned)_n); } while (0)
+/* how many body lines start with this marker, headers excluded */
+static int count_marks(Str text, char mark) {
+  int n = 0, at_line = 1;
+  for (int i = 0; i < text.len; i++) {
+    if (at_line && text.p[i] == mark) {
+      if (!(mark == '-' && !strncmp(text.p + i, "--- ", 4)) &&
+          !(mark == '+' && !strncmp(text.p + i, "+++ ", 4))) n++;
+    }
+    at_line = (text.p[i] == '\n');
+  }
+  return n;
+}
 static V op(const char *at, const char *kind, const char *text, int n) {
   Rec *r = rec_new(&AR);
   rec_setz(&AR, r, "at", v_str(s_lit(&AR, at)));
@@ -105,6 +126,25 @@ int main(void) {
     CK(s_eq(A[5].at, anchor_at(&AR, "t.c", 5, A[4].text, A[5].text, A[6].text)));
     CK(s_eq(A[0].at, anchor_at(&AR, "t.c", 0, s_null(), A[0].text, A[1].text)));  /* first: prev empty */
     CK(s_eq(A[19].at, anchor_at(&AR, "t.c", 19, A[18].text, A[19].text, s_null()))); /* last: next empty */
+    /* KNOWN ANSWER. Everything else in this file compares one anchor against
+     * another, so a change to the hash preimage - dropping the "vxa1" tag, the
+     * separators, or quietly folding the path back in - would move every anchor
+     * together and stay green. An agent has stored these strings in its scripts
+     * and in its plan tokens, so the bytes are the contract: these values were
+     * computed with Python hashlib over sha256("vxa1\0prev\0cur\0next")[:8]. */
+    CKSTR(anchor_at(&AR, NULL, 0, s_null(), s_null(), s_null()), "5489b3e6");
+    CKSTR(anchor_at(&AR, "t.c", 0, s_null(), s_lit(&AR, "a"), s_lit(&AR, "bc")), "e683a24c");
+    {
+      Str one = s_lit(&AR, "one"), two = s_lit(&AR, "two");
+      Str empty = s_lit(&AR, "");
+      CKSTR(anchor_at(&AR, "a.txt", 0, s_null(), one, two), "a6df4333");
+      CKSTR(anchor_at(&AR, "a.txt", 1, one, two, empty), "89202342");
+      CKSTR(anchor_at(&AR, "a.txt", 2, two, empty, s_lit(&AR, "four")), "7777f219");
+      CKSTR(anchor_at(&AR, "a.txt", 3, empty, s_lit(&AR, "four"), empty), "9da7ade2");
+      CKSTR(anchor_at(&AR, "a.txt", 4, s_lit(&AR, "four"), empty, s_null()), "860dc4c1");
+      /* the same three lines under a different path and index: unchanged bytes */
+      CKSTR(anchor_at(&AR, "zz/deep/x.py", 9000, two, empty, s_lit(&AR, "four")), "7777f219");
+    }
     CKI(A[0].n, 0);
     CKI(A[19].n, 19);
     CKSTR(A[0].text, "l01");
@@ -288,8 +328,8 @@ int main(void) {
     CKI(fld(r, "checks").u.l->len, 1);
 
     r = tx_patch_apply(&AR, t, "t.c", opl(1, op(atc(t, 2), "del", NULL, 0)));
-    CK(inStr(sfld(r, "text"), "l01\nl02\nl04\nl05\nl06\nl07\n"));   /* the line is gone */
-    CK(!inStr(sfld(r, "text"), "\nl03\n"));
+    /* the whole 19-line file, not a fragment of it: nothing else moved */
+    CKEQ(sfld(r, "text"), "l01\nl02\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\n");
     CK(cntstr(sfld(r, "text"), "\n") == 19);
     c0 = opat(fld(r, "checks"), 0);
     CK(bfld(c0, "ok"));
@@ -297,7 +337,7 @@ int main(void) {
     CKSTR(sfld(c0, "preview"), "L3: l04");           /* what took its place */
 
     r = tx_patch_apply(&AR, t, "t.c", opl(1, op(atc(t, 0), "ins_before", "TOP", 0)));
-    CK(s_ni(sfld(r, "text"), "TOP\nl01\n"));
+    CKEQ(sfld(r, "text"), "TOP\nl01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\n");
     c0 = opat(fld(r, "checks"), 0);
     CK(bfld(c0, "ok"));
     CKI(ifld(c0, "line"), 1);
@@ -306,7 +346,8 @@ int main(void) {
     CKSTR(sfld(r, "path"), "t.c");
 
     r = tx_patch_apply(&AR, t, "t.c", opl(1, op(atc(t, 19), "ins_after", "BOTTOM", 0)));
-    CK(inStr(sfld(r, "text"), "l19\nl20\nBOTTOM\n"));               /* tail check */
+    CKEQ(sfld(r, "text"), "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nBOTTOM\n");
+    /* the tail line was added, nothing else moved */
     CK(cntstr(sfld(r, "text"), "\n") == 21);
     c0 = opat(fld(r, "checks"), 0);
     CKI(ifld(c0, "line"), 21);
@@ -318,14 +359,14 @@ int main(void) {
     CKI(ifld(r, "applied"), 1);
     CKI(ifld(c0, "line"), 3);
     CK(inStr(sfld(c0, "preview"), "L3: m1"));
-    CK(inStr(sfld(r, "text"), "l01\nl02\nm1\nm2\nm3\nl03\n"));
+    CKEQ(sfld(r, "text"), "l01\nl02\nm1\nm2\nm3\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\n");
     CK(cntstr(sfld(r, "text"), "\n") == 23);
 
     /* multi-line set */
     r = tx_patch_apply(&AR, t, "t.c", opl(1, op(atc(t, 0), "set", "s1\ns2", 0)));
     c0 = opat(fld(r, "checks"), 0);
     CK(bfld(c0, "ok"));
-    CK(inStr(sfld(r, "text"), "s1\ns2\nl02\n"));
+    CKEQ(sfld(r, "text"), "s1\ns2\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\n");
 
     /* checks report NEW line numbers after upstream insertions */
     r = tx_patch_apply(&AR, t, "t.c", opl(2,
@@ -338,18 +379,18 @@ int main(void) {
     CKI(ifld(c1, "line"), 6);                        /* was 5, shifted by the insert */
     CKSTR(sfld(c1, "preview"), "L6: NEW5");
     CK(bfld(c1, "ok"));
-    CK(inStr(sfld(r, "text"), "TOP\nl01\nl02\nl03\nl04\nNEW5\nl06\n"));
+    CKEQ(sfld(r, "text"), "TOP\nl01\nl02\nl03\nl04\nNEW5\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\n");
 
     /* two insertions on one line do not conflict; order is the ops order */
     r = tx_patch_apply(&AR, t, "t.c", opl(2,
        op(atc(t, 0), "ins_after", "X", 0), op(atc(t, 0), "ins_after", "Y", 0)));
     CK(r.t == V_REC);
-    CK(inStr(sfld(r, "text"), "l01\nX\nY\nl02\n"));
+    CKEQ(sfld(r, "text"), "l01\nX\nY\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\n");
     /* insertion attached to a deleted line */
     r = tx_patch_apply(&AR, t, "t.c", opl(2,
        op(atc(t, 1), "del", NULL, 0), op(atc(t, 1), "ins_after", "KEPT", 0)));
     CK(r.t == V_REC);
-    CK(inStr(sfld(r, "text"), "l01\nKEPT\nl03\n"));
+    CKEQ(sfld(r, "text"), "l01\nKEPT\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\n");
   }
   T("checks.ok goes false when the edit cannot be proven");
   { /* deleting one of two identical adjacent lines: the content is still there,
@@ -521,25 +562,33 @@ int main(void) {
     CKI(ifld(d, "adds"), 1);
     CKI(ifld(d, "dels"), 1);
     CKI(ifld(d, "hunks"), 1);
-    CK(inStr(sfld(d, "text"), "@@ -1,5 +1,5 @@"));
-    CK(inStr(sfld(d, "text"), "-gamma"));
-    CK(inStr(sfld(d, "text"), "+GAMMA"));
-    CK(inStr(sfld(d, "text"), " beta"));
+    /* the entire unified body, not four fragments of it: the hunk header,
+     * the context lines, and that a one-line change costs exactly one add
+     * and one del and rewrites nothing else */
+    CKEQ(sfld(d, "text"), "--- a\n+++ b\n@@ -1,5 +1,5 @@\n alpha\n beta\n+GAMMA\n-gamma\n delta\n epsilon\n");
+    CKI(count_marks(sfld(d, "text"), '+'), 1);
+    CKI(count_marks(sfld(d, "text"), '-'), 1);
+    CKI(cntstr(sfld(d, "text"), "\n"), 9);   /* 2 headers + the hunk line + 6 body lines */
     d = tx_diff(&AR, t5, w, 3, true);                 /* pure insert into 5 lines */
     CKI(ifld(d, "adds"), 2);
     CKI(ifld(d, "dels"), 0);
     CKI(ifld(d, "hunks"), 1);
-    CK(inStr(sfld(d, "text"), "@@ -1,5 +1,7 @@"));
+    CKEQ(sfld(d, "text"), "--- a\n+++ b\n@@ -1,5 +1,7 @@\n alpha\n beta\n+X\n+Y\n gamma\n delta\n epsilon\n");
+    CKI(count_marks(sfld(d, "text"), '+'), 2);
+    CKI(count_marks(sfld(d, "text"), '-'), 0);
     d = tx_diff(&AR, t5, x, 3, true);                 /* pure delete */
     CKI(ifld(d, "adds"), 0);
     CKI(ifld(d, "dels"), 1);
     CKI(ifld(d, "hunks"), 1);
-    CK(inStr(sfld(d, "text"), "@@ -1,5 +1,4 @@"));
+    CKEQ(sfld(d, "text"), "--- a\n+++ b\n@@ -1,5 +1,4 @@\n alpha\n beta\n-gamma\n delta\n epsilon\n");
+    CKI(count_marks(sfld(d, "text"), '+'), 0);
+    CKI(count_marks(sfld(d, "text"), '-'), 1);
     { V a = tx_diff(&AR, t5, u, 0, true), b = tx_diff(&AR, t5, u, -7, true), e = tx_diff(&AR, t5, u, 3, true);
       CK(s_eq(sfld(a, "text"), sfld(b, "text")));     /* ctxl<=0 means 3 */
       CK(s_eq(sfld(a, "text"), sfld(e, "text")));       /* and so is the explicit 3 */       /* and that is the explicit 3 */
       V c = tx_diff(&AR, t5, u, 1, true);
-      CK(inStr(sfld(c, "text"), "@@ -2,3 +2,3 @@"));  /* ctxl=1 shrinks the hunk */
+      /* ctxl=1 shrinks the hunk: line 1 and line 5 fall out of the window */
+      CKEQ(sfld(c, "text"), "--- a\n+++ b\n@@ -2,3 +2,3 @@\n beta\n+GAMMA\n-gamma\n delta\n");
       CKI(ifld(c, "hunks"), 1);
     }
     { /* two distant changes -> 2 hunks, close changes -> merged into 1 */
@@ -667,7 +716,12 @@ int main(void) {
       CKI(n2, 50);
       /* unified form of the same pair agrees with the stats */
       d = tx_diff(&AR, ta, tb, 3, true);
-      CK(cntstr(sfld(d, "text"), "\n-") >= 50);
+      /* every deletion and addition, counted in the text the diff printed -
+       * a ">=" would still pass on a hunk that duplicated or dropped lines */
+      CKI(count_marks(sfld(d, "text"), '-'), 50);
+      CKI(count_marks(sfld(d, "text"), '+'), 50);
+      CKI(ifld(d, "dels"), count_marks(sfld(d, "text"), '-'));
+      CKI(ifld(d, "adds"), count_marks(sfld(d, "text"), '+'));
       CK(inStr(sfld(d, "text"), "--- a\n+++ b\n"));
     }
     { /* bounded-work guard: past 4000x4000 cells fall back to a whole replace */
@@ -737,5 +791,25 @@ int main(void) {
     CKSTR(sfld(opat(fld(r, "checks"), 0), "preview"), "L2: BB");
     CK(!inStr(sfld(r, "text"), "00"));
   }
+  T("known_answer_anchors");
+  {
+    /* Independently computed with Python hashlib from SPEC 4.2:
+       at = base16(sha256("vxa1" NUL prev NUL cur NUL next))[:8]
+       file "alpha = 1
+beta = 2
+gamma = 3
+"
+       Anchors must equal an outside oracle, not merely agree with each other. */
+    static const char *want[3] = { "7666d8e1", "309407b7", "c5d91e39" };
+    Str k = s_lit(&AR, "alpha = 1\nbeta = 2\ngamma = 3\n");
+    ErrCode ke = E_NONE;
+    int kn = 0;
+    Anch *KA = anchors_of(&AR, "k.c", k, &kn, &ke);
+    CKI(kn, 3);
+    for (int i = 0; i < 3 && KA; i++) CKS(KA[i].at.p, want[i]);
+    CK(anchors_of(&AR, "k.c", s_lit(&AR, "a\r\nb\r\n"), &kn, &ke) != NULL);
+    CKI(kn, 2);
+  }
+
   T_REPORT("xdiff");
 }
