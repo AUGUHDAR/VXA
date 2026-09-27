@@ -306,8 +306,13 @@ V fs_read_range(Ctx *c, const char *path, int from, int to, const char *grep,
     int idx = keep[i];
     Str l = lines[idx];
     char pre[32];
-    if (anchors && acount == nl) snprintf(pre, sizeof pre, "L%d:%s| ", idx + 1, A[idx].at.p);
-    else snprintf(pre, sizeof pre, "L%d| ", idx + 1);
+    pre[0] = 0;
+    if (anchors) {
+      /* never degrade silently: a read that claims anchors but hands back bare
+       * line numbers would feed tx.patch anchors that do not exist */
+      if (acount != nl) { *err = E_INTERNAL; set_error(c, E_INTERNAL, "fs.read(%s): anchor table has %d entries for %d lines; refusing to emit partial anchors", path, acount, nl); return VN; }
+      snprintf(pre, sizeof pre, "L%d:%s| ", idx + 1, A[idx].at.p);
+    }
     int need = (int)strlen(pre) + l.len + 1;
     if (max_bytes > 0 && bytes + need > max_bytes) { truncated = true; break; }
     buf_puts(&b, pre);
