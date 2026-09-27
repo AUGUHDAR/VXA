@@ -132,6 +132,8 @@ typedef struct {
   bool redact;
   Str  stdin_data;
   bool stdin_set;
+  ShEnv env;              /* overrides merged into the child's block; empty => none */
+  bool env_set;
   bool confirm_set;
   Confirm confirm;
   int  jobs;              /* sh.jobs only */
@@ -168,6 +170,77 @@ static bool keys_ok(Ctx *c, Args *x, int oi, const char *const *allowed, const c
       return false;
     }
   }
+  return true;
+}
+
+/* ---------------- env:{NAME:"value"} -> the child's overrides ----------------
+ * Format-strict on purpose. shell.c turns each pair into one `NAME=value` line in
+ * the block handed to CreateProcess/exec, so:
+ *   - a name holding '=' or a control byte would describe a variable the child
+ *     cannot have (and a leading '=' is the block's own separator syntax),
+ *   - two names differing only in case are ONE variable on Windows, and which
+ *     value won would depend on record order -- so that is an error, not a merge,
+ *   - a number is not a string: `env:{JOBS:4}` is a typo for `env:{JOBS:"4"}`, and
+ *     VXA fixes typos by refusing, not by guessing.
+ * Values are never inspected or masked here: they reach the child as written, and
+ * the plan/journal only ever see KEY=*** (see plan_exec_env). */
+#define SH_MAX_ENV 256
+
+static bool name_eq(const char *x, const char *y) {
+  for (; *x && *y; x++, y++) {
+    int a = (*x >= 'A' && *x <= 'Z') ? *x - 'A' + 'a' : (unsigned char)*x;
+    int b = (*y >= 'A' && *y <= 'Z') ? *y - 'A' + 'a' : (unsigned char)*y;
+    if (a != b) return false;
+  }
+  return !*x && !*y;
+}
+
+static bool env_from(Ctx *c, Rec *r, ShOpt *o, const char *who) {
+  Arena *a = ctx_arena(c);
+  int n = r ? r->len : 0;
+  o->env_set = true;
+  if (n == 0) return true;                       /* {env:{}} overrides nothing, and costs no token */
+  if (n > SH_MAX_ENV) {
+    set_error(c, E_LIMIT, "%s: env sets %d variables, the limit is %d - pass only what the child reads",
+              who, n, SH_MAX_ENV);
+    return false;
+  }
+  ShEnvPair *p = (ShEnvPair*)arena_zalloc(a, sizeof(ShEnvPair) * (size_t)n);
+  int k = 0;
+  for (int i = 0; i < n; i++) {
+    Str key = r->kv[i].k;
+    V val = r->kv[i].v;
+    const char *ks = key.p ? key.p : "";
+    if (key.len <= 0) {
+      set_error(c, E_BAD_INPUT, "%s: an env name is empty - write env:{NAME:\"value\"}", who);
+      return false;
+    }
+    for (int j = 0; j < key.len; j++) {
+      unsigned char ch = (unsigned char)ks[j];
+      if (ch == '=' || ch < 0x20 || ch == 0x7f) {
+        set_error(c, E_BAD_INPUT,
+                  "%s: env name '%.*s' holds byte 0x%02x, which cannot appear in a variable name "
+                  "(a name is the part before the first '=')", who, key.len, ks, (unsigned)ch);
+        return false;
+      }
+    }
+    if (val.t != V_STR) {
+      set_error(c, E_TYPE, "%s: env['%.*s'] must be a string, got %s - quote the value: \"%.*s\"",
+                who, key.len, ks, v_typename(val), key.len, ks);
+      return false;
+    }
+    for (int j = 0; j < k; j++)
+      if (name_eq(p[j].k, ks)) {
+        set_error(c, E_BAD_INPUT,
+                  "%s: env sets '%.*s' twice (names differ only in case, which is one variable "
+                  "on Windows) - keep the value you mean", who, key.len, ks);
+        return false;
+      }
+    p[k].k = arena_strndup(a, ks, (size_t)key.len);
+    p[k].v = arena_strdup(a, val.u.s.p ? val.u.s.p : "");
+    k++;
+  }
+  o->env.p = p; o->env.n = k;
   return true;
 }
 
@@ -217,8 +290,16 @@ static bool shopt_get(Ctx *c, Args *x, int oi, int def_tail, const char *const *
   if (rv.t != V_NULL) o->redact = v_truthy(rv);
 
   V sv = opt_field(x, oi, "stdin");
-  if (sv.t == V_STR) { o->stdin_data = sv.u.s; o->stdin_set = sv.u.s.len > 0; }
-  else if (sv.t != V_NULL) {
+  if (sv.t == V_STR) {
+    o->stdin_data = sv.u.s;
+    /* Any string counts as "stdin was given", the empty one included: it is what a
+     * caller writes to feed zero bytes. To the CHILD there is nothing to tell the
+     * two apart -- both are a file at immediate EOF, because stdin is redirected
+     * from a file we control rather than left on the console -- so the difference
+     * is recorded in the plan (stdin=sha:...,len:0 vs no stdin key at all) and the
+     * doc says plainly that an empty input is not a way to test for one. */
+    o->stdin_set = true;
+  } else if (sv.t != V_NULL) {
     set_error(c, E_TYPE, "%s: stdin must be a string, got %s", who, v_typename(sv));
     return false;
   }
@@ -241,12 +322,12 @@ static bool shopt_get(Ctx *c, Args *x, int oi, int def_tail, const char *const *
 
   V ev = opt_field(x, oi, "env");
   if (ev.t != V_NULL) {
-    /* sh_exec has no env parameter and plan_exec_opts has no env field, so an
-     * env record cannot reach the child at all. Refuse rather than ignore. */
-    set_error(c, E_UNSUPPORTED,
-              "%s: opt=env is unsupported - sh_exec/plan_exec_opts carry no environment, "
-              "so it would be silently dropped; pass what the child needs as arguments", who);
-    return false;
+    if (ev.t != V_REC) {
+      set_error(c, E_TYPE, "%s: env must be a record {NAME:\"value\"}, got %s",
+                who, v_typename(ev));
+      return false;
+    }
+    if (!env_from(c, ev.u.r, o, who)) return false;
   }
 
   V wv = opt_field(x, oi, "cwd");
@@ -283,12 +364,14 @@ static Confirm policy_of(Ctx *c, const ShOpt *o, bool ro_fast, bool *auto_run) {
 
 /* ---------------- execution: shell.c owns every byte of this ---------------- */
 static V run_now(Ctx *c, const Cmd *m, const ShOpt *o, const char *op,
-                 const char *token, bool auto_run) {
+                 const char *token, bool auto_run, Plan *p) {
   Arena *a = ctx_arena(c);
   ShRes r;
   memset(&r, 0, sizeof r);
-  sh_exec(c, m->line, o->cwd, o->stdin_set ? o->stdin_data.p : NULL,
-          o->timeout_ms, o->tail, o->redact, &r);
+  const char *in = o->stdin_set ? (o->stdin_data.p ? o->stdin_data.p : "") : NULL;
+  size_t in_len = o->stdin_set ? (size_t)(o->stdin_data.len > 0 ? o->stdin_data.len : 0) : 0;
+  sh_exec_env(c, m->line, o->cwd, in, in_len, o->env.n ? &o->env : NULL,
+              o->timeout_ms, o->tail, o->redact, &r);
   V res = sh_result_v(c, &r, m->line);
   sh_free(&r);
   if (res.t != V_REC) return res;
@@ -297,18 +380,21 @@ static V run_now(Ctx *c, const Cmd *m, const ShOpt *o, const char *op,
   if (auto_run) rec_setz(a, res.u.r, "auto", v_bool(true));
   if (token && *token) rec_setz(a, res.u.r, "token", v_str(s_lit(a, token)));
   /* the receipt an auto run owes the journal: the same line plan_execute writes
-   * for a confirmed apply (SPEC 3.4) */
-  journal_note(c, "apply", (token && *token) ? token : "-", op);
+   * for a confirmed apply (SPEC 3.4), env names masked and input by hash */
+  journal_note(c, "apply", (token && *token) ? token : "-",
+               p ? plan_journal_detail(p).p : op);
   return res;
 }
 
-/* Plan for one command + its options. `executes_now` is the promise that the
- * caller really is about to run it (so stdin can be honoured); `mark_auto` puts
- * the auto=t record in the canonical args, which is what distinguishes a
- * fast-path plan from the same command asked about. Every plan_add_arg happens
- * before the token is taken, or the token would not cover what it claims to. */
-static Plan *plan_for(Ctx *c, const Cmd *m, const ShOpt *o, Confirm need, bool executes_now,
-                      bool mark_auto, const char *op, const char *name) {
+/* Plan for one command + its options. `mark_auto` puts the auto=t record in the
+ * canonical args, which is what distinguishes a fast-path plan from the same
+ * command asked about. Every plan_add_arg happens before the token is taken, or
+ * the token would not cover what it claims to -- which is why env and stdin are
+ * bound here and not at run time: the same setters feed the plan's payload, so a
+ * confirmed apply runs with the environment and the input that were hashed into
+ * the token the caller is holding. */
+static Plan *plan_for(Ctx *c, const Cmd *m, const ShOpt *o, Confirm need, bool mark_auto,
+                      const char *op, const char *name) {
   Arena *a = ctx_arena(c);
   Plan *p = plan_exec_new(c, op, need, m->v);
   if (!p || ctx_has_err(c)) return NULL;
@@ -317,19 +403,11 @@ static Plan *plan_for(Ctx *c, const Cmd *m, const ShOpt *o, Confirm need, bool e
   plan_add_arg(c, p, "tail", s_fmt(a, "%d", o->tail).p);
   plan_add_arg(c, p, "redact", o->redact ? "t" : "f");
   if (name && *name) plan_add_arg(c, p, "name", name);
-  if (o->stdin_set) {
-    if (!executes_now) {
-      /* plan.c's do_exec passes NULL stdin, so a confirmed plan would run the
-       * child with an empty stdin and never say so. */
-      set_error(c, E_UNSUPPORTED,
-                "sh: opt=stdin is only honoured on a run that executes at once (read-only "
-                "argv, sh.ro, or {confirm:\"none\"}) - the confirmed exec path passes no "
-                "stdin to the child");
-      return NULL;
-    }
-    Str h = hash12(a, o->stdin_data.p, (size_t)o->stdin_data.len);
-    plan_add_arg(c, p, "stdin", h.p);      /* different input => different token */
-  }
+  if (o->env_set && o->env.n) plan_exec_env(c, p, &o->env);
+  if (o->stdin_set)
+    plan_exec_stdin(c, p, o->stdin_data.p ? o->stdin_data.p : "",
+                    (size_t)(o->stdin_data.len > 0 ? o->stdin_data.len : 0));
+  if (ctx_has_err(c)) return NULL;
   if (mark_auto) plan_add_arg(c, p, "auto", "t");
   return p;
 }
@@ -346,10 +424,10 @@ static V f_run(Ctx *c, V *args, int nargs) {
 
   bool auto_run = false;
   Confirm need = policy_of(c, &o, m.ro_fast, &auto_run);
-  Plan *p = plan_for(c, &m, &o, need, auto_run, auto_run, "sh.run", NULL);
+  Plan *p = plan_for(c, &m, &o, need, auto_run, "sh.run", NULL);
   if (!p) return VN;
   Str tok = plan_token(c, p);
-  if (auto_run) return run_now(c, &m, &o, "sh.run", tok.p, true);
+  if (auto_run) return run_now(c, &m, &o, "sh.run", tok.p, true, p);
   /* gate closed: `--confirm <token>` on the command line replays this exact plan
    * (SPEC 3.4); otherwise the agent gets the PLAN and reads the token out of it */
   const char *cli = ctx_confirm(c);
@@ -377,10 +455,10 @@ static V f_ro(Ctx *c, V *args, int nargs) {
   }
   /* sh.ro always executes at once, so stdin is honoured; it is not the sh.run
    * fast path, so no auto=t in its canonical args */
-  Plan *p = plan_for(c, &m, &o, CF_NONE, true, false, "sh.ro", NULL);
+  Plan *p = plan_for(c, &m, &o, CF_NONE, false, "sh.ro", NULL);
   if (!p) return VN;
   Str tok = plan_token(c, p);
-  V res = run_now(c, &m, &o, "sh.ro", tok.p, false);
+  V res = run_now(c, &m, &o, "sh.ro", tok.p, false, p);
   if (res.t == V_REC) rec_setz(ctx_arena(c), res.u.r, "ro", v_bool(true));
   return res;
 }
@@ -408,7 +486,7 @@ static V f_out(Ctx *c, V *args, int nargs) {
   if (!shopt_get(c, &x, 1, SH_OUT_TAIL, RUN_OPTS, "sh.out", &o)) return VN;
   bool auto_run = false;
   Confirm need = policy_of(c, &o, m.ro_fast, &auto_run);
-  Plan *p = plan_for(c, &m, &o, need, auto_run, auto_run, "sh.out", NULL);
+  Plan *p = plan_for(c, &m, &o, need, auto_run, "sh.out", NULL);
   if (!p) return VN;
   Str tok = plan_token(c, p);
   if (!auto_run) {
@@ -419,7 +497,7 @@ static V f_out(Ctx *c, V *args, int nargs) {
     V *f = rec_getz(res.u.r, "out");
     return (f && f->t == V_STR) ? *f : v_str(s_lit(ctx_arena(c), ""));
   }
-  V res = run_now(c, &m, &o, "sh.out", tok.p, true);
+  V res = run_now(c, &m, &o, "sh.out", tok.p, true, p);
   if (res.t != V_REC) return res;
   V *f = rec_getz(res.u.r, "out");
   return (f && f->t == V_STR) ? *f : v_str(s_lit(ctx_arena(c), ""));
@@ -613,6 +691,14 @@ static V f_jobs(Ctx *c, V *args, int nargs) {
   plan_add_arg(c, p, "tail", s_fmt(a, "%d", o.tail).p);
   plan_add_arg(c, p, "redact", o.redact ? "t" : "f");
   if (o.cwd) plan_add_arg(c, p, "cwd", o.cwd);
+  /* env and stdin bind the WHOLE graph too: they are run-wide options here (every
+   * job gets them), so a token minted for one environment must not be spendable on
+   * a replay that changed it -- otherwise {token:...} would be a way to confirm a
+   * command set while quietly swapping the CC/PATH it runs under. */
+  if (o.env_set && o.env.n) plan_exec_env(c, p, &o.env);
+  if (o.stdin_set)
+    plan_exec_stdin(c, p, o.stdin_data.p ? o.stdin_data.p : "",
+                    (size_t)(o.stdin_data.len > 0 ? o.stdin_data.len : 0));
   /* no "auto" marker in the plan args here: the same job list has to produce the
    * same token whether it is being inspected or replayed with {token:...} */
   Str tok = plan_token(c, p);
@@ -663,10 +749,10 @@ static V f_jobs(Ctx *c, V *args, int nargs) {
     jo.confirm_set = true;                    /* the gate above already passed */
     jo.confirm = CF_NONE;
     if (j->timeout_ms) jo.timeout_ms = j->timeout_ms;
-    Plan *cp = plan_for(c, &j->cmd, &jo, CF_NONE, true, true, "sh.jobs", j->name.p);
+    Plan *cp = plan_for(c, &j->cmd, &jo, CF_NONE, true, "sh.jobs", j->name.p);
     if (!cp) return VN;
     Str ctok = plan_token(c, cp);
-    V res = run_now(c, &j->cmd, &jo, "sh.jobs", ctok.p, true);
+    V res = run_now(c, &j->cmd, &jo, "sh.jobs", ctok.p, true, cp);
     if (res.t != V_REC) {
       set_error(c, E_INTERNAL, "sh.jobs: job '%.*s' returned no result record",
                 j->name.len, j->name.p);
@@ -711,27 +797,30 @@ static V f_jobs(Ctx *c, V *args, int nargs) {
   return rec_to_v(r);
 }
 
-/* ---------------- registry: one row per builtin, doc + example with it ------ */
+/* ---------------- registry: one row per builtin, doc + example with it ------
+ * The sig/doc pair here IS the documentation an agent reads (`vxa doc sh.run`), so
+ * env and stdin are spelled out the way they now behave: merged, not replaced; fed
+ * through a file, not a shell; bound into the token, shown masked. */
 static const Builtin sh_tab[] = {
   { "sh", "run", f_run, 1, 2,
-    "sh.run(argv|[str], {cwd,timeout:30,tail:40,stdin,redact:true,confirm:\"ask\"}) -> PLAN|{code,out,err,ms}",
-    "run a command; costs a confirm round trip unless the argv is provably read-only, which runs at once and leaves a receipt - a string command never skips confirmation",
-    "sh.run([\"go\",\"test\",\"./...\"], {timeout:120})", 0 },
+    "sh.run(argv|[str], {cwd,timeout:30,tail:40,env:{K:\"V\"},stdin:\"\",redact:true,confirm:\"ask\"}) -> PLAN|{code,out,err,ms}",
+    "gated unless the argv is provably read-only; env:{K:V} is MERGED over this process's environment (PATH stays, nothing is ever setenv'd here) and stdin is fed to the child from a file, no shell - to the child stdin:\"\" and no stdin are the same immediate EOF, though the plan still tells them apart; both are hashed into the token and printed masked as env=K=***,stdin=sha:..,len:..",
+    "sh.run([\"go\",\"test\",\"./...\"], {env:{GOFLAGS:\"-mod=mod\"}, timeout:120})", 0 },
   { "sh", "ro", f_ro, 1, 2,
-    "sh.ro(argv|[str], {cwd,timeout:30,tail:40,redact:true}) -> {code,out,err,ms}",
-    "read-only allowlist execution with no plan phase; refuses with POLICY rather than run anything unproven, so never use it for a write",
+    "sh.ro(argv|[str], {cwd,timeout:30,tail:40,env:{K:\"V\"},stdin:\"\",redact:true}) -> {code,out,err,ms}",
+    "read-only allowlist execution with no plan phase; refuses with POLICY rather than run anything unproven, so never use it for a write; env/stdin behave as in sh.run",
     "sh.ro([\"git\",\"status\"])", 0 },
   { "sh", "allowed", f_allowed, 1, 1,
     "sh.allowed(argv|[str]) -> bool",
     "check before you pick a path: true means sh.ro accepts it and sh.run executes at once - a string is gated whatever this answers",
     "ok = sh.allowed([\"git\",\"diff\"])", BF_PURE },
   { "sh", "out", f_out, 1, 2,
-    "sh.out(argv|[str], {tail:200}) -> str|PLAN",
+    "sh.out(argv|[str], {cwd,timeout:30,tail:200,env:{K:\"V\"},stdin:\"\",redact:true}) -> str|PLAN",
     "only stdout, more lines; same policy as sh.run so it cannot bypass confirmation, and it drops the exit code - use sh.run when the code matters",
     "sh.out([\"cat\",\"notes.txt\"])", 0 },
   { "sh", "jobs", f_jobs, 1, 2,
-    "sh.jobs([{name,cmd,needs,timeout}], {jobs:1,all:false,confirm:\"ask\",token}) -> PLAN|{done,failed,first_fail}",
-    "run a dependency-ordered command set in one round trip; a needs cycle is an error, a failure stops the run unless all:true, jobs>1 is accepted but runs 1 at a time",
+    "sh.jobs([{name,cmd,needs,timeout}], {jobs:1,all:false,env:{K:\"V\"},stdin:\"\",confirm:\"ask\",token}) -> PLAN|{done,failed,first_fail}",
+    "run a dependency-ordered command set in one round trip; env and stdin are run-wide and bound into the graph's token; a needs cycle is an error, a failure stops the run unless all:true, jobs>1 is accepted but runs 1 at a time",
     "sh.jobs([{name:\"a\",cmd:[\"cat\",\"a.txt\"]}], {all:true})", 0 },
 };
 const Builtin *t_sh(int *n) { *n = (int)(sizeof(sh_tab) / sizeof(sh_tab[0])); return sh_tab; }

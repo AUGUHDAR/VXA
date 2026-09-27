@@ -105,6 +105,14 @@ void path_ext(const char *p, char *out, size_t n);  /* ".c" / "" */
 bool path_is_abs(const char *p);
 bool path_within(const char *root_norm, const char *p_norm);
 
+/* ---------- child environment overrides (SPEC 4.3: sh.run(.., {env:{K:V}})) ----------
+ * One option crossing three modules, which is why the type is here and not in
+ * shell_int.h: lib_sh parses the {env:{K:V}} record, plan.c binds it into the
+ * token, shell.c merges it into the block the child actually gets.
+ * Keys and values are NUL-terminated and outlive the call (arena-owned). */
+typedef struct { const char *k; const char *v; } ShEnvPair;
+typedef struct { ShEnvPair *p; int n; } ShEnv;
+
 /* ---------- values ---------- */
 typedef struct V V;
 typedef struct Node Node;
@@ -217,6 +225,15 @@ void  plan_set_payload(Ctx *c, Plan *p, const char *data, size_t n);
 void  plan_set_move(Ctx *c, Plan *p, const char *to);
 Plan *plan_exec_new(Ctx *c, const char *op, Confirm need, V argv_or_str);
 void  plan_exec_opts(Ctx *c, Plan *p, const char *cwd, int timeout_ms, int tail, bool redact);
+/* The two options plan_exec_opts predates. Both BOUND into the canonical text, so
+ * a token minted for one environment or one stdin is not spendable on another:
+ * plan_exec_env stores the pairs for the child and adds `env=KEY=sha(value)..`,
+ * plan_exec_stdin keeps the bytes and adds `stdin=sha:..,len:N`. Neither the
+ * values nor the input bytes ever reach the printed plan or the journal: see
+ * plan_journal_detail, which is the redacted form both of those show. */
+void  plan_exec_env(Ctx *c, Plan *p, const ShEnv *env);
+void  plan_exec_stdin(Ctx *c, Plan *p, const char *data, size_t n);
+Str   plan_journal_detail(Plan *p);   /* "sh.run,env=CC=***,stdin=sha:x,len:3" */
 enum { PK_WRITE, PK_APPEND, PK_DELETE, PK_MOVE, PK_RESTORE, PK_EXEC, PK_CFG };
 Confirm policy_for(Ctx *c, const char *what);   /* manifest/config lookup, default jail */
 
@@ -277,6 +294,20 @@ typedef struct {
 } ShRes;
 void sh_exec(Ctx *c, const char *cmd, const char *cwd, const char *stdin_data,
              int timeout_ms, int tail_lines, bool redact, ShRes *r);
+/* sh_exec plus an environment and an exact stdin length. Kept as a second entry
+ * point rather than a new parameter on sh_exec, whose shape is frozen by the
+ * stubs other suites link against. stdin_len counts bytes (a VXA string may hold
+ * NULs); pass 0 to mean "use strlen(stdin_data)". env==NULL => inherit only. */
+void sh_exec_env(Ctx *c, const char *cmd, const char *cwd, const char *stdin_data,
+                 size_t stdin_len, const ShEnv *env, int timeout_ms, int tail_lines,
+                 bool redact, ShRes *r);
+/* Environment order, shared by the child's block (shell.c) and the plan's env
+ * fingerprint (plan.c): Windows requires the block sorted case-insensitively by
+ * variable NAME with any leading '=' ignored (real blocks do carry `=C:=C:\dir`
+ * drive-map entries), ties break on the rest of the entry so the order is stable.
+ * sh_env_cmp_pp is the same comparator in qsort form over `char *const *`. */
+int  sh_env_key_cmp(const char *x, const char *y);
+int  sh_env_cmp_pp(const void *x, const void *y);
 void sh_free(ShRes *r);
 V    sh_result_v(Ctx *c, ShRes *r, const char *cmd);
 bool sh_is_readonly(const char *cmd);

@@ -35,6 +35,10 @@ struct Plan {
   char *to;                          /* move destination */
   char *cmd; char **argv; int argc;   /* exec payload */
   char *cwd; int timeout; int tail; bool redact;
+  ShEnv env;                          /* exec: overrides the child gets, values stay here */
+  char *env_disp;                     /* exec: "CC=***,GOFLAGS=***" for plan/journal text */
+  char *in_data; size_t in_len; bool in_set;   /* exec: stdin payload */
+  char *in_disp;                      /* exec: "sha:<12>,len:<n>" */
   long seq;                          /* restore */
   char token[16];
   bool sealed;
@@ -284,6 +288,12 @@ static V plan_value(Ctx *c, Plan *p) {
   }
   rec_setz(a, r, "files", list_of(files));
   rec_setz(a, r, "count", v_num((double)p->nt));
+  /* Keys appear only when the plan actually sets them, so a plain command still
+   * prints exactly what it printed before. The values are masked here for the same
+   * reason the canonical text carries hashes: this record is what an agent pastes
+   * into a transcript, and what `vxa plan` writes out. */
+  if (p->env_disp) rec_setz(a, r, "env", v_str(s_lit(a, p->env_disp)));
+  if (p->in_disp) rec_setz(a, r, "stdin", v_str(s_lit(a, p->in_disp)));
   return rec_to_v(r);
 }
 
@@ -320,11 +330,18 @@ static ErrCode verify_targets(Ctx *c, Plan *p) {
 static V do_exec(Ctx *c, Plan *p) {
   Arena *a = ctx_arena(c);
   ShRes r; memset(&r, 0, sizeof r);
+  /* The env and the input the token was minted for, handed to the child here and
+   * nowhere else: this is the confirmed path, and it is the reason a plan carries
+   * the payload at all rather than only its fingerprint. */
+  const char *in = p->in_set ? p->in_data : NULL;
+  size_t in_len = p->in_set ? p->in_len : 0;
+  const ShEnv *env = p->env.n ? &p->env : NULL;
   if (p->argv) {
     char *joined = sh_join_argv(p->argv, p->argc);
-    sh_exec(c, joined, p->cwd, NULL, p->timeout, p->tail, p->redact, &r);
+    sh_exec_env(c, joined, p->cwd, in, in_len, env, p->timeout, p->tail, p->redact, &r);
   } else {
-    sh_exec(c, p->cmd ? p->cmd : "", p->cwd, NULL, p->timeout, p->tail, p->redact, &r);
+    sh_exec_env(c, p->cmd ? p->cmd : "", p->cwd, in, in_len, env,
+                p->timeout, p->tail, p->redact, &r);
   }
   V out = sh_result_v(c, &r, p->argv ? p->argv[0] : p->cmd);
   sh_free(&r);
@@ -408,7 +425,7 @@ V plan_execute(Ctx *c, Plan *p, const char *given) {
     set_error(c, e, "apply failed for %s: %s", p->op, err_hint(e));
     return VN;
   }
-  journal_note(c, "apply", tokz, p->op);
+  journal_note(c, "apply", tokz, plan_journal_detail(p).p);
   if (res.t == V_REC) rec_set(a, res.u.r, s_wrap("token"), v_str(s_lit(a, tokz)));
   return res;
 }
@@ -503,6 +520,76 @@ void plan_exec_opts(Ctx *c, Plan *p, const char *cwd, int timeout_ms, int tail, 
   if (tail >= 0) p->tail = tail;
   p->redact = redact;
   plan_add_arg(c, p, "timeout", s_fmt(a, "%d", p->timeout).p);
+}
+
+/* ---------- env + stdin: bound into the token, never written in the clear -----
+ * WHY the token covers them at all: a confirmation is a statement about ONE
+ * execution. A token minted for `{env:{CC:"gcc"}}` must not be spendable on the
+ * same command line with a different PATH/CC, and a token minted for a plan that
+ * pipes a patch must not run with empty input -- so both go into the canonical
+ * text, exactly like a file's old hash does.
+ * WHY only hashes get into the canonical text: canonical() is the source of the
+ * printed plan and of every journal/audit line, and those are plain text on disk
+ * that outlives the run. Environment values are where agents put tokens and
+ * database passwords, so the plan carries `KEY=sha256(value)[:12]`: enough to make
+ * the token change when the value changes, useless as a leak. */
+static void join_sorted(char **v, int n, Buf *b) {
+  qsort(v, (size_t)n, sizeof(char*), sh_env_cmp_pp);
+  for (int i = 0; i < n; i++) { if (i) buf_putc(b, ','); buf_puts(b, v[i]); }
+}
+
+void plan_exec_env(Ctx *c, Plan *p, const ShEnv *env) {
+  Arena *a = ctx_arena(c);
+  if (!p || !env || env->n <= 0) return;
+  int n = env->n;
+  ShEnvPair *cp = (ShEnvPair*)arena_zalloc(a, sizeof(ShEnvPair) * (size_t)n);
+  char **fp = (char**)arena_zalloc(a, sizeof(char*) * (size_t)n);    /* KEY=hash(value) */
+  char **dp = (char**)arena_zalloc(a, sizeof(char*) * (size_t)n);    /* KEY=***         */
+  for (int i = 0; i < n; i++) {
+    cp[i].k = arena_strdup(a, env->p[i].k ? env->p[i].k : "");
+    cp[i].v = arena_strdup(a, env->p[i].v ? env->p[i].v : "");
+    Str k = s_wrap(cp[i].k);
+    fp[i] = s_fmt(a, "%.*s=%s", k.len, k.p, hash12(a, cp[i].v, strlen(cp[i].v)).p).p;
+    dp[i] = s_fmt(a, "%.*s=***", k.len, k.p).p;
+  }
+  Buf f, d;
+  buf_init(&f, a); join_sorted(fp, n, &f);
+  buf_init(&d, a); join_sorted(dp, n, &d);
+  p->env.p = cp; p->env.n = n;
+  p->env_disp = buf_take(&d).p;
+  plan_add_arg(c, p, "env", buf_str(&f).p);
+  p->sealed = false;
+}
+
+void plan_exec_stdin(Ctx *c, Plan *p, const char *data, size_t n) {
+  Arena *a = ctx_arena(c);
+  if (!p) return;
+  p->in_data = (char*)arena_zalloc(a, n + 1);
+  if (n && data) memcpy(p->in_data, data, n);
+  p->in_data[n] = 0;
+  p->in_len = n;
+  p->in_set = true;
+  Str h = hash12(a, data ? data : "", n);
+  p->in_disp = s_fmt(a, "sha:%s,len:%zu", h.p, n).p;
+  /* The input itself never enters the canonical text either, for the same reason a
+   * secret does not: a patch or a here-doc is the payload, and the journal would
+   * copy it. len+hash binds it just as tightly. */
+  plan_add_arg(c, p, "stdin", p->in_disp);
+  p->sealed = false;
+}
+
+/* What an apply receipt says about an exec plan: the op, then the two options in
+ * the only form that is safe to put on disk -- env names with masked values, the
+ * input by hash and length. Non-exec plans, and exec plans that set neither, get
+ * just the op name, exactly as they always did. */
+Str plan_journal_detail(Plan *p) {
+  if (!p) return s_wrap("");
+  Arena *a = ctx_arena(p->cx);
+  Buf b; buf_init(&b, a);
+  buf_puts(&b, p->op ? p->op : "-");
+  if (p->env_disp) buf_fmt(&b, ",env=%s", p->env_disp);
+  if (p->in_disp) buf_fmt(&b, ",stdin=%s", p->in_disp);
+  return buf_take(&b);
 }
 
 V op_apply(Ctx *c, V pv, V tokv) {

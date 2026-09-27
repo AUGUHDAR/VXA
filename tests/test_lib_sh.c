@@ -147,6 +147,54 @@ static bool journal_has(const char *token) {
   fclose(f);
   return hit;
 }
+/* the whole journal: the secret tests need to say "this string appears NOWHERE in
+ * it", which a per-line token search cannot prove */
+static const char *journal_all(void) {
+  char path[512];
+  snprintf(path, sizeof path, "%s/.vxa/journal.ndjson", ctx_root(cx));
+  FILE *f = fopen(path, "rb");
+  if (!f) return NULL;
+  Buf b; buf_init(&b, &ar);
+  char chunk[4096];
+  size_t got;
+  while ((got = fread(chunk, 1, sizeof chunk, f)) > 0) buf_put(&b, chunk, got);
+  fclose(f);
+  return buf_take(&b).p;
+}
+/* the compact form an agent (or `vxa plan`, or the NEED_CONFIRM hint) is shown */
+static const char *plan_compact(V plan) {
+  if (plan.t != V_PLAN) return NULL;
+  Buf b; buf_init(&b, &ar);
+  plan_disp(plan.u.pl, &b, true);
+  return buf_take(&b).p;
+}
+/* A variable the TEST process owns, as the parent of every child spawned below:
+ * the merge cases prove it is still visible to a child, and the no-leak cases
+ * prove nothing a child was given ever came back into it. */
+static void proc_set(const char *k, const char *v) {
+#ifdef _WIN32
+  char b[512];
+  snprintf(b, sizeof b, "%s=%s", k, v);
+  _putenv(b);
+#else
+  setenv(k, v, 1);
+#endif
+}
+/* env:{K:V,...} option record, pairs of (name, value) */
+static V optenv(int npairs, ...) {
+  va_list ap;
+  Rec *ev = rec_new(&ar);
+  va_start(ap, npairs);
+  for (int i = 0; i < npairs; i++) {
+    const char *k = va_arg(ap, const char*);
+    const char *v = va_arg(ap, const char*);
+    rec_setz(&ar, ev, k, S(v));
+  }
+  va_end(ap);
+  Rec *o = rec_new(&ar);
+  rec_setz(&ar, o, "env", rec_to_v(ev));
+  return rec_to_v(o);
+}
 
 int main(void) {
   ensure_dir_for("build/tmp_sh_test");
@@ -441,15 +489,28 @@ int main(void) {
     CK(is_err(two("run", AV(2, "cat", "l300.txt"), v_rec(&ar, 1, "tail", v_num(-1))), E_RANGE));
   }
 
-  /* ============ 11. options that cannot be honoured are refused =========== */
+  /* ============ 11. options ============================================== */
   T("options");
   {
+    /* env and stdin used to be refused with E_UNSUPPORTED because sh_exec and
+     * plan_exec_opts could not carry them. They can now, so the same calls are
+     * asserted as WORKING (sections 14-16 below); an empty env record is the one
+     * case that must stay token-neutral. */
     V e = two("run", AV(2, "cat", "one.txt"), v_rec(&ar, 1, "env", v_rec(&ar, 0)));
-    CK(is_err(e, E_UNSUPPORTED));
-    CK(errmsg(e) && strstr(errmsg(e), "env") != NULL);
+    CK(!v_is_err(e));
+    CKI(num(e, "code"), 0);
+    CKS(out_of(e), "one\n");
+    n_run++;
+    char te[24], tn[24];
+    tokz(one("run", AV(2, "echo", "hi")), tn, sizeof tn);
+    tokz(two("run", AV(2, "echo", "hi"), v_rec(&ar, 1, "env", v_rec(&ar, 0))), te, sizeof te);
+    CKS(te, tn);                                     /* {env:{}} overrides nothing => same plan */
     V e2 = two("ro", AV(2, "cat", "one.txt"),
-               v_rec(&ar, 1, "env", v_rec(&ar, 2, "PATH", S("/bin"))));
-    CK(is_err(e2, E_UNSUPPORTED));
+               v_rec(&ar, 1, "env", v_rec(&ar, 1, "VXASH_ONE", S("1"))));
+    CK(!v_is_err(e2));
+    CKI(num(e2, "code"), 0);
+    CKS(out_of(e2), "one\n");
+    n_run++;
     CK(is_err(two("run", AV(2, "cat", "one.txt"), v_rec(&ar, 1, "tiemout", v_num(5))), E_BAD_INPUT));
     V ue = two("run", AV(2, "cat", "one.txt"), v_rec(&ar, 1, "tiemout", v_num(5)));
     CK(errmsg(ue) && strstr(errmsg(ue), "timeout") != NULL);    /* names the real keys */
@@ -462,14 +523,21 @@ int main(void) {
     CKI(num(n, "code"), 0);
     V aa = two("run", AV(2, "cat", "one.txt"), v_rec(&ar, 1, "confirm", S("all")));
     CK(aa.t == V_PLAN);                              /* audit mode: even ro asks */
-    /* stdin reaches the child on a run that executes at once, and is refused when
-     * the command has to be confirmed (plan.c passes no stdin to its child) */
+    /* stdin now reaches the child on EVERY path, including a plan that has to be
+     * confirmed first (plan.c carries the bytes it hashed) */
     V si = two("run", AV(2, "cat", "-"), v_rec(&ar, 1, "stdin", S("piped\n")));
     n_run++;
     CK(!v_is_err(si));
     CKS(out_of(si), "piped\n");
     V sg = two("run", S("cat -"), v_rec(&ar, 1, "stdin", S("piped\n")));
-    CK(is_err(sg, E_UNSUPPORTED));
+    CK(sg.t == V_PLAN);                              /* a string is gated, not refused */
+    char tg[24];
+    tokz(sg, tg, sizeof tg);
+    V rg = apply(sg, tg);
+    n_run++;
+    CK(!v_is_err(rg));
+    CKS(out_of(rg), "piped\n");
+    CK(is_err(two("run", AV(2, "cat", "one.txt"), v_rec(&ar, 1, "stdin", v_num(3))), E_TYPE));
     CK(is_err(two("ro", AV(2, "cat", "one.txt"), v_rec(&ar, 1, "cwd", S("../.."))), E_OUTSIDE_JAIL));
     V cw = two("run", AV(2, "cat", "one.txt"), v_rec(&ar, 1, "cwd", S(".")));
     n_run++;
@@ -655,6 +723,316 @@ int main(void) {
     tokz(p, s2, sizeof s2);
     CKS(s1, s2);
     CK(p.t == V_PLAN);
+  }
+
+  /* ============ 14. env: merged into the child, never into this process ===== */
+  T("env: the override reaches the child, through the CONFIRMED path");
+  proc_set("VXASH_PARENT", "from-parent");
+  {
+    V p = two("run", AV(3, "printenv", "VXASH_PARENT", "VXASH_T1"),
+              optenv(1, "VXASH_T1", "t1-value"));
+    CK(p.t == V_PLAN);                               /* printenv is not allowlisted */
+    char tk[24];
+    tokz(p, tk, sizeof tk);
+    V r = apply(p, tk);
+    n_run++;
+    CK(!v_is_err(r));
+    CKI(num(r, "code"), 0);
+    /* both lines, in the order asked for: the override AND a variable that only
+     * exists in this (parent) process -- merge, not replace */
+    CKS(out_of(r), "from-parent\nt1-value\n");
+    /* and the child was told nothing about who set it: the plan record still
+     * carries no value */
+    CK(strstr(plan_compact(p), "t1-value") == NULL);
+  }
+
+  T("env: fast path and sh.ro carry it too");
+  {
+    V n = two("run", AV(2, "printenv", "VXASH_T2"),
+              v_rec(&ar, 2, "confirm", S("none"), "env", v_rec(&ar, 1, "VXASH_T2", S("t2"))));
+    n_run++;
+    CK(n.t == V_REC && !v_is_err(n));
+    CK(truth(n, "auto"));
+    CKS(out_of(n), "t2\n");
+    V ro = two("ro", AV(2, "cat", "one.txt"), optenv(1, "VXASH_T3", "t3"));
+    n_run++;
+    CK(!v_is_err(ro));
+    CKI(num(ro, "code"), 0);
+    CKS(out_of(ro), "one\n");
+    CK(truth(ro, "ro"));
+    const char *jt = str(ro, "token");
+    CK(jt && journal_has(jt));
+    CK(jt && strstr(journal_all(), "VXASH_T3=***") != NULL);   /* keys only in the receipt */
+    CK(journal_all() && strstr(journal_all(), "t3") == NULL);
+  }
+
+  T("env: overriding an existing name changes only this child");
+  {
+    proc_set("VXASH_LEAK", "orig");
+    V a = two("run", AV(2, "printenv", "VXASH_LEAK"), optenv(1, "VXASH_LEAK", "over"));
+    char ta[24];
+    tokz(a, ta, sizeof ta);
+    V ra = apply(a, ta);
+    n_run++;
+    CKS(out_of(ra), "over\n");
+    /* read the parent back, twice: from inside the process, and from a second
+     * child that was given no env at all */
+    CKS(getenv("VXASH_LEAK"), "orig");
+    V b = two("run", AV(2, "printenv", "VXASH_LEAK"), v_rec(&ar, 1, "confirm", S("none")));
+    n_run++;
+    CKS(out_of(b), "orig\n");
+    CKS(getenv("VXASH_LEAK"), "orig");
+    /* and a variable that was ONLY ever an override is still absent here */
+    CK(getenv("VXASH_T1") == NULL);
+    V c = two("run", AV(2, "printenv", "VXASH_T1"), v_rec(&ar, 1, "confirm", S("none")));
+    n_run++;
+    CKI(num(c, "code"), 1);                          /* the child says: not in my env */
+    CK(str(c, "out") == NULL);
+  }
+
+  T("env: values that are empty, or hold '=' and spaces, arrive whole");
+  {
+    V a = two("run", AV(2, "printenv", "VXASH_EMPTY"),
+              optenv(1, "VXASH_EMPTY", ""));
+    char t1[24];
+    tokz(a, t1, sizeof t1);
+    V r = apply(a, t1);
+    n_run++;
+    CKI(num(r, "code"), 0);
+    CKS(out_of(r), "\n");                            /* set, but to nothing */
+    V w = two("run", AV(2, "printenv", "VXASH_WEIRD"), optenv(1, "VXASH_WEIRD", "a b=c d"));
+    char t2[24];
+    tokz(w, t2, sizeof t2);
+    V r2 = apply(w, t2);
+    n_run++;
+    CK(!v_is_err(r2));
+    CKI(num(r2, "code"), 0);
+    CKS(out_of(r2), "a b=c d\n");                    /* not cut at '=', not split at ' ' */
+  }
+
+  T("env: bad names and bad values are refused, not dropped");
+  {
+    CK(is_err(two("run", AV(2, "cat", "one.txt"), v_rec(&ar, 1, "env", v_num(3))), E_TYPE));
+    CK(is_err(two("run", AV(2, "cat", "one.txt"), v_rec(&ar, 1, "env", S("x"))), E_TYPE));
+    V v1 = two("run", AV(2, "cat", "one.txt"), v_rec(&ar, 1, "env", v_rec(&ar, 1, "JOBS", v_num(4))));
+    CK(is_err(v1, E_TYPE));
+    CK(errmsg(v1) && strstr(errmsg(v1), "JOBS") != NULL);   /* names the offending key */
+    V v2 = two("run", AV(2, "cat", "one.txt"), v_rec(&ar, 1, "env", v_rec(&ar, 1, "A=B", S("c"))));
+    CK(is_err(v2, E_BAD_INPUT));
+    CK(errmsg(v2) && strstr(errmsg(v2), "'='") != NULL);
+    V v3 = two("run", AV(2, "cat", "one.txt"),
+               v_rec(&ar, 1, "env", v_rec(&ar, 2, "PATH", S("a"), "Path", S("b"))));
+    CK(is_err(v3, E_BAD_INPUT));                     /* one Windows variable, two values */
+    V v4 = two("run", AV(2, "cat", "one.txt"), v_rec(&ar, 1, "env", v_rec(&ar, 1, "A\nB", S("c"))));
+    CK(is_err(v4, E_BAD_INPUT));                     /* a newline would break the block */
+    CK(is_err(two("run", AV(2, "cat", "one.txt"), v_rec(&ar, 1, "stdin", v_num(3))), E_TYPE));
+    CK(file_exists("marker"));                       /* none of them ran anything */
+  }
+
+  /* ============ 15. stdin: fed without a shell, on every path ============== */
+  T("stdin: bytes arrive on the confirmed path, the fast path and sh.ro");
+  {
+    const char *patch = "--- a\n+++ b\n@@ -1 +1 @@\n-x\n+y\n";
+    V g = two("run", S("cat -"), v_rec(&ar, 1, "stdin", S(patch)));
+    CK(g.t == V_PLAN);
+    char tg[24];
+    tokz(g, tg, sizeof tg);
+    V rg = apply(g, tg);
+    n_run++;
+    CK(!v_is_err(rg));
+    CKS(out_of(rg), patch);                          /* every byte, in order */
+    V f = two("run", AV(2, "cat", "-"), v_rec(&ar, 1, "stdin", S("fast\n")));
+    n_run++;
+    CKS(out_of(f), "fast\n");
+    V ro = two("ro", AV(2, "cat", "-"), v_rec(&ar, 1, "stdin", S("ro bytes\n")));
+    n_run++;
+    CKS(out_of(ro), "ro bytes\n");
+    /* an input with a trailing newline is one line; tail shaping must not eat it */
+    V nl = two("ro", AV(2, "cat", "-"), v_rec(&ar, 1, "stdin", S("a\nb\n")));
+    n_run++;
+    CKS(out_of(nl), "a\nb\n");
+    CKI(num(nl, "total_lines"), 2);
+  }
+
+  T("stdin: empty input and no input both reach immediate EOF");
+  {
+    V a = two("ro", AV(2, "cat", "-"), v_rec(&ar, 1, "stdin", S("")));
+    n_run++;
+    CK(!v_is_err(a));
+    CKI(num(a, "code"), 0);
+    CK(str(a, "out") == NULL);                       /* nothing came back, nothing hung */
+    V b = one("ro", AV(2, "cat", "-"));
+    n_run++;
+    CKI(num(b, "code"), 0);
+    CK(str(b, "out") == NULL);
+    /* and the plan says which of the two it was, so the token covers the choice */
+    char t0[24], tn[24];
+    tokz(two("run", S("cat -"), v_rec(&ar, 1, "stdin", S(""))), t0, sizeof t0);
+    tokz(one("run", S("cat -")), tn, sizeof tn);
+    CK(strcmp(t0, tn) != 0);
+    CK(strstr(plan_compact(two("run", S("cat -"), v_rec(&ar, 1, "stdin", S("")))),
+               "stdin=\"sha:") != NULL);              /* the empty input is still its own plan */
+  }
+
+  T("stdin: a NUL byte is data, not a terminator (the length travels)");
+  {
+    V in = v_str(s_from(&ar, "a\0b", 3));
+    CKI(in.u.s.len, 3);
+    V r = two("ro", AV(2, "cat", "-"), v_rec(&ar, 1, "stdin", in));
+    n_run++;
+    CK(!v_is_err(r));
+    CKI(num(r, "code"), 0);
+    V *o = rk(r, "out");
+    CK(o && o->t == V_STR);
+    CK(o && o->u.s.len == 3);                        /* not cut short at the NUL */
+    CK(o && o->u.s.p && !memcmp(o->u.s.p, "a\0b", 3));
+    /* and the plan hashed all 3 bytes, not the 1 byte a strlen would have seen */
+    char t1[24], t2[24];
+    tokz(two("run", S("cat -"), v_rec(&ar, 1, "stdin", in)), t1, sizeof t1);
+    tokz(two("run", S("cat -"), v_rec(&ar, 1, "stdin", S("a"))), t2, sizeof t2);
+    CK(strcmp(t1, t2) != 0);
+    CK(strstr(plan_compact(two("run", S("cat -"), v_rec(&ar, 1, "stdin", in))),
+               ",len:3\"") != NULL);
+  }
+
+  /* ============ 16. the token binds both, the text leaks neither =========== */
+  T("token: one byte of env or stdin difference is a different confirmation");
+  {
+    char base[24], e1[24], e2[24], s1[24], s2[24], ord1[24], ord2[24];
+    tokz(one("run", S("echo hi")), base, sizeof base);
+    tokz(two("run", S("echo hi"), optenv(1, "CC", "gcc")), e1, sizeof e1);
+    tokz(two("run", S("echo hi"), optenv(1, "CC", "clang")), e2, sizeof e2);
+    tokz(two("run", S("cat -"), v_rec(&ar, 1, "stdin", S("a\n"))), s1, sizeof s1);
+    tokz(two("run", S("cat -"), v_rec(&ar, 1, "stdin", S("b\n"))), s2, sizeof s2);
+    CK(strcmp(base, e1) != 0);                       /* no env => cannot spend on env */
+    CK(strcmp(e1, e2) != 0);                         /* only the VALUE changed */
+    CK(strcmp(s1, s2) != 0);                         /* only the INPUT changed */
+    CK(strcmp(e1, s1) != 0);
+    /* same keys, same values, different order in the record => SAME token: the
+     * canonical text sorts, so an agent's dict order is not part of the plan */
+    tokz(two("run", S("echo hi"), optenv(2, "GOFLAGS", "-mod=mod", "GOPATH", "/g")), ord1, sizeof ord1);
+    tokz(two("run", S("echo hi"), optenv(2, "GOPATH", "/g", "GOFLAGS", "-mod=mod")), ord2, sizeof ord2);
+    CKS(ord1, ord2);
+    /* a stale confirmation must not run: mint on one env, apply with another */
+    V p = two("run", S("echo hi > stale-out"), optenv(1, "CC", "gcc"));
+    char tk[24];
+    tokz(p, tk, sizeof tk);
+    V q = two("run", S("echo hi > stale-out"), optenv(1, "CC", "clang"));
+    char tq[24];
+    tokz(q, tq, sizeof tq);
+    CK(strcmp(tk, tq) != 0);
+    V bad = apply(q, tk);
+    CK(is_err(bad, E_BAD_TOKEN));
+    CK(!file_exists("stale-out"));                   /* nothing ran */
+  }
+
+  T("secrets: the printed plan and the journal carry keys and hashes only");
+  {
+    const char *secret = "ghp_DO-NOT-LEAK-9f3a21";
+    const char *body = "PATCH-Payload-Must-Stay-Off-Disk";   /* 32 bytes */
+    V p = two("run", AV(2, "printenv", "GH_TOKEN"),
+              v_rec(&ar, 2, "stdin", S(body),
+                    "env", v_rec(&ar, 2, "GH_TOKEN", S(secret), "CC", S("gcc"))));
+    CK(p.t == V_PLAN);
+    const char *disp = plan_compact(p);
+    CK(disp != NULL);
+    /* the compact format quotes any value holding '=', ',' or ':' (SPEC 2.1), so
+     * the plan line reads env="CC=***,GH_TOKEN=***" -- keys only, sorted, masked */
+    CK(strstr(disp, "env=\"CC=***,GH_TOKEN=***\"") != NULL);
+    CK(strstr(disp, "stdin=\"sha:") != NULL);
+    CK(strstr(disp, ",len:32\"") != NULL);            /* strlen(body) bytes, hashed not copied */
+    CK(strstr(disp, secret) == NULL);
+    CK(strstr(disp, secret) == NULL);
+    CK(strstr(disp, body) == NULL);
+    char tk[24];
+    tokz(p, tk, sizeof tk);
+    Rec *pr = rec_new(&ar);
+    plan_to_v(cx, p.u.pl, pr);
+    V pv = rec_to_v(pr);
+    CKS(str(pv, "env"), "CC=***,GH_TOKEN=***");
+    CK(strstr(str(pv, "stdin"), body) == NULL);
+    V r = apply(p, tk);
+    n_run++;
+    CK(!v_is_err(r));
+    CKS(out_of(r), "ghp_DO-NOT-LEAK-9f3a21\n");       /* the CHILD really did get it */
+    CKS(str(r, "token"), tk);
+    const char *j = journal_all();
+    CK(j != NULL);
+    CK(strstr(j, secret) == NULL);                   /* never in the journal ... */
+    CK(strstr(j, body) == NULL);
+    CK(strstr(j, tk) != NULL);
+    /* the receipt line itself, exact: at=<op>,env=keys,stdin=sha+len */
+    CK(strstr(j, "at=sh.run,env=CC=***,GH_TOKEN=***,stdin=sha:") != NULL);
+    /* the NEED_CONFIRM hint goes through the same plan_value path */
+    V p2 = two("run", AV(2, "printenv", "GH_TOKEN"), optenv(1, "GH_TOKEN", secret));
+    V e = apply(p2, "");
+    CK(is_err(e, E_NEED_CONFIRM));
+    const char *m = errmsg(e);
+    CK(m && strstr(m, secret) == NULL);
+    CK(m && strstr(m, "GH_TOKEN=***") != NULL);
+  }
+
+  T("output redaction still runs (env/stdin did not weaken it)");
+  {
+    V r = two("run", S("echo TOKEN=abc123def456"), v_rec(&ar, 1, "confirm", S("none")));
+    n_run++;
+    CK(out_of(r) && strstr(out_of(r), "TOKEN=abc1***") != NULL);
+    CK(out_of(r) && strstr(out_of(r), "abc123def456") == NULL);
+    V raw = two("run", S("echo TOKEN=abc123def456"),
+                v_rec(&ar, 2, "confirm", S("none"), "redact", v_bool(false)));
+    n_run++;
+    CK(out_of(raw) && strstr(out_of(raw), "abc123def456") != NULL);  /* off means off */
+  }
+
+  T("sh.jobs binds env and stdin into the graph token");
+  {
+    V jobs = v_list(&ar, 1, v_rec(&ar, 2, "name", S("e"), "cmd", S("echo hi > jobs-env")));
+    V g0 = one("jobs", jobs);
+    V g1 = two("jobs", jobs, optenv(1, "CC", "gcc"));
+    V g2 = two("jobs", jobs, optenv(1, "CC", "clang"));
+    const char *t0 = str(g0, "token"), *t1 = str(g1, "token"), *t2 = str(g2, "token");
+    CK(t0 && t1 && t2);
+    CKI(strlen(t1), 12);
+    CK(strcmp(t0, t1) != 0);                          /* env added => a new plan */
+    CK(strcmp(t1, t2) != 0);                          /* one value byte changed => a new plan */
+    V bad = two("jobs", jobs, v_rec(&ar, 2, "token", S(t2),
+                                    "env", v_rec(&ar, 1, "CC", S("gcc"))));
+    CK(is_err(bad, E_BAD_TOKEN));                     /* t2 was minted for clang */
+    CK(!file_exists("jobs-env"));
+    V ok = two("jobs", jobs, v_rec(&ar, 2, "token", S(t1),
+                                   "env", v_rec(&ar, 1, "CC", S("gcc"))));
+    n_run++;
+    CK(!v_is_err(ok));
+    CKI(num(ok, "ran"), 1);
+    CK(file_exists("jobs-env"));
+    remove("jobs-env");
+  }
+
+  /* ============ 17. the registry IS the documentation ==================== */
+  T("doc rows describe env and stdin as they now behave");
+  {
+    int k = 0;
+    const Builtin *t = t_sh(&k);
+    CKI(k, 5);
+    CK(strstr(t[0].sig, "env:{K:") != NULL);          /* sh.run's sig lists the option */
+    CK(strstr(t[0].sig, "stdin:") != NULL);
+    CK(strstr(t[0].doc, "MERGED") != NULL);
+    CK(strstr(t[0].doc, "env=K=***") != NULL);
+    CK(strstr(t[0].ex, "env:{") != NULL);             /* the example an agent copies works */
+    CK(strstr(t[1].sig, "env:{K:") != NULL);          /* sh.ro */
+    CK(strstr(t[1].sig, "stdin:") != NULL);
+    CK(strstr(t[3].sig, "env:{K:") != NULL);          /* sh.out */
+    CK(strstr(t[4].sig, "env:{K:") != NULL);          /* sh.jobs */
+    for (int i = 0; i < k; i++) {
+      CHECK(t[i].sig && !strstr(t[i].sig, "E_UNSUPPORTED"), "row %d still advertises a refusal", i);
+      CHECK(t[i].doc && !strstr(t[i].doc, "unsupported"), "row %d doc says unsupported", i);
+    }
+    /* nothing in the sh namespace refuses these two options any more */
+    V r = two("run", AV(2, "cat", "one.txt"),
+              v_rec(&ar, 2, "env", v_rec(&ar, 1, "VXASH_D", S("1")), "stdin", S("")));
+    n_run++;
+    CK(!v_is_err(r));
+    CK(is_err(r, E_UNSUPPORTED) == false);
   }
 
   printf("commands this test let run: %d\n", n_run);

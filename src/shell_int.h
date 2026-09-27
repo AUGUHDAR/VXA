@@ -81,12 +81,38 @@ bool   sh_blob_secret(const char *p, size_t n);
 size_t sh_ident_run(const char *p, size_t n, size_t i);   /* end of run, or i */
 bool   sh_key_run(const char *p, size_t n);               /* run is a secret key name */
 
-/* ---------- spawn engines (platform internals, used by sh_exec) ----------
+/* ---------- child environment ----------
+ * sh_env_block merges the parent's block with the overrides and lays the result
+ * out exactly as CreateProcessA's lpEnvironment wants it:
+ *   - one "KEY=VALUE" per entry, entries separated by a NUL each,
+ *   - sorted case-insensitively by NAME with a leading '=' ignored (sh_env_key_cmp
+ *     in vxa.h; real blocks contain `=C:=C:\dir` drive-map entries that must not
+ *     sort before everything else),
+ *   - the whole block terminated by an EXTRA NUL (so the last entry is followed by
+ *     two NULs), which is what tells the child where the block ends.
+ * `base` is a NULL-terminated array of "KEY=VALUE" strings and may be NULL.
+ * An override REPLACES the parent entry with the same name (matched
+ * case-insensitively, because Windows names are) and keeps the override's own
+ * spelling; an unknown name is added. Returns NULL when the merged block would be
+ * empty, which is the caller's cue to pass lpEnvironment == NULL.
+ * NOTE the _putenv trap this replaces: mutating the *process* environment to pass
+ * one variable to one child leaks into every later command and into the parent. */
+char *sh_env_block(Arena *a, char *const *base, const ShEnv *ovr, size_t *nbytes);
+/* The parent's own block, platform-flavored (`_environ` on Windows, `environ` on
+ * POSIX), as a NULL-terminated array for sh_env_block. */
+char *const *sh_env_parent(void);
+
+/* ---------- spawn engines (platform internals, used by sh_exec_env) ----------
  * Return true only if a process was actually started (and so out/err/time
- * mean something). false means nothing ran and code is a SH_* sentinel. */
+ * mean something). false means nothing ran and code is a SH_* sentinel.
+ * stdin_data/stdin_len: NULL data means no input was given, a non-NULL zero-length
+ * one means "empty input" -- both hand the child a file at EOF, and only the plan
+ * records the difference. env==NULL => the child inherits the parent's block. */
 bool sh_spawn_argv(Ctx *c, char *const *argv, int argc, const char *cwd,
-                   const char *stdin_data, int timeout_ms, ShRes *r);
+                   const char *stdin_data, size_t stdin_len, const ShEnv *env,
+                   int timeout_ms, ShRes *r);
 bool sh_spawn_shell(Ctx *c, const char *cmd, const char *cwd,
-                    const char *stdin_data, int timeout_ms, ShRes *r);
+                    const char *stdin_data, size_t stdin_len, const ShEnv *env,
+                    int timeout_ms, ShRes *r);
 
 #endif

@@ -88,6 +88,19 @@ $ vxa doc fs.read                                          ->  从注册表生�
 单元套件当前：util 66 / val 329 / lex 203 / parse 222 / sim 187 / xdiff 303 全绿；
 outline、lib_fs、lib_tx、lib_sh 的测试脚手架仍在收尾（链接期 main 符号重复、t_sh 重复定义）。
 
+## 本轮新增能力
+
+- `fs.read(..., {cursor:N})`：截断后按页续读；`cursor` 恒为"下一未读行"，用 `cursor >= total` 判读完。
+  实测 867 行文件按 300 字节分页：`1-7` → `8-867`，两页 shown 之和恰等于 total（不重不漏）。
+- `sh.run(argv, {env:{...}, stdin:"..."})`：环境变量合并注入（不改父进程）、stdin 喂入。
+  令牌绑定 env 的**键+值哈希**与 stdin 的**长度+哈希**，明文不进计划、不进 journal、不进 audit。
+
+## 已知缺陷（下一轮先修这个）
+
+- 链式 `sh.run(...).apply()` 带 `--confirm TOKEN` 时报 `cannot call a null`；
+  写成 `p = sh.run(...); p.apply()` 正常。根因在 V_PLAN 作为方法接收者的链式路径上，
+  `field_of` 先查计划字段失败、落到 call_fn 时函数值为空。需修并补一条链式用例。
+
 ## 已知未完成 / 坑
 
 - `main.c`、`lib_sh.c` 落地中；`lib_fs.c` 有 `s_trim` 参数个数的改动冲突待清。

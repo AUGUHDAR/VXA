@@ -8,8 +8,13 @@
  *     itself out of the quote it lives in.
  *   - a string containing shell metacharacters is an explicit request for
  *     shell semantics: it goes through cmd.exe /c and can never be read-only.
- *   - two temp files instead of pipes: no pipe-buffer deadlock, and the real
- *     byte size is known before we touch memory (we seek, never slurp).
+ *   - three temp files instead of pipes: no pipe-buffer deadlock, and the real
+ *     byte size is known before we touch memory (we seek, never slurp). Stdin is
+ *     handed over as a file we wrote, so a command that reads input never finds
+ *     the console and waits for a keystroke nobody is going to press.
+ *   - the child's environment is a block we build per run (parent's entries +
+ *     the caller's overrides, merged and sorted). The process environment is
+ *     never touched: it would leak one command's env into every later one.
  *   - timeout is a wall-clock budget; on expiry the child is killed together
  *     with its whole tree (job object with KILL_ON_JOB_CLOSE / POSIX process
  *     group) and whatever it had already written is still returned.
@@ -114,11 +119,22 @@ void sh_quote(Buf *b, const char *arg) {
   buf_putc(b, '"');
 }
 
+/* cmd.exe is the one program whose "arguments" are really a command line: it
+ * re-parses them itself, and its documented quote handling means an always-quoted
+ * tail does NOT run -- given `"cmd" "/c" "echo %X%"` cmd keeps the leading quote
+ * and goes looking for a program called `"echo`. A [cmd, /c|/k, one argument]
+ * argv therefore hands that one argument over verbatim; see cmd_tail_slot below
+ * for the exact (metacharacter-free only) condition and why it adds no shell
+ * semantics that the argv path did not already refuse. */
+static int cmd_tail_slot(char *const *argv, int argc);
+
 Str sh_command_line(Arena *a, char *const *argv, int argc) {
   Buf b; buf_init(&b, a);
+  int tail = cmd_tail_slot(argv, argc);
   for (int i = 0; i < argc; i++) {
     if (i) buf_putc(&b, ' ');
-    sh_quote(&b, argv[i] ? argv[i] : "");
+    if (i == tail) buf_puts(&b, argv[i]);        /* cmd re-parses this one itself */
+    else sh_quote(&b, argv[i] ? argv[i] : "");
   }
   return buf_take(&b);
 }
@@ -186,6 +202,34 @@ static bool ni_has(const char *s, const char *low) {
   if (!ln || ls < ln) return false;
   for (size_t i = 0; i + ln <= ls; i++) if (!ni_strn(s + i, low, ln)) return true;
   return false;
+}
+
+/* the tail rule of sh_command_line, in one place:
+ * is_cmd_prog: program is cmd, however named or pathed (a `C:\Windows\System32\`
+ * prefix changes nothing about how it parses /c);
+ * cmd_tail_slot: the index of the ONE argument after a /c or /k switch, and only
+ * when that argument contains no shell metacharacter and no quote. A tail carrying
+ * `; & | $ ` > <` or a newline stays quoted, so it remains one literal word that
+ * cmd cannot start -- relaxing the quoting here never turns argv into a shell. */
+static bool is_cmd_prog(const char *prog) {
+  if (!prog || !*prog) return false;
+  const char *base = prog + strlen(prog);
+  while (base > prog && base[-1] != '/' && base[-1] != '\\') base--;
+  return ni_eq(base, "cmd") || ni_eq(base, "cmd.exe") || ni_eq(base, "cmd.com");
+}
+
+static int cmd_tail_slot(char *const *argv, int argc) {
+  if (argc < 3 || !is_cmd_prog(argv[0])) return -1;
+  for (int i = 1; i < argc; i++) {
+    if (!argv[i]) return -1;
+    if (!ni_eq(argv[i], "/c") && !ni_eq(argv[i], "/k")) continue;
+    if (i + 1 != argc - 1) return -1;          /* more than one tail argument: quote all */
+    const char *t = argv[i + 1];
+    if (!t || !*t) return -1;
+    if (sh_has_meta(t) || strchr(t, '"')) return -1;
+    return i + 1;
+  }
+  return -1;
 }
 
 /* canonical program name: bare word, at most one .exe/.com suffix */
@@ -257,6 +301,108 @@ bool sh_is_readonly(const char *cmd) {
   int argc = sh_split(cmd, buf, sizeof buf, argv, SH_MAXARGS);
   if (argc <= 0) return false;
   return sh_argv_readonly(argv, argc);
+}
+
+/* =====================================================================
+ * 3b. the child's environment
+ *     Built per run, never installed into this process.
+ * ===================================================================== */
+
+/* ASCII-only case folding on purpose: a locale-dependent tolower would order the
+ * block differently on two machines, and then the env fingerprint in a plan would
+ * not be reproducible across them. */
+static int env_fold(int ch) {
+  return (ch >= 'A' && ch <= 'Z') ? ch - 'A' + 'a' : ch;
+}
+
+/* Offset and length of an entry's NAME: past any leading '=' (a real Windows
+ * block carries drive-map entries like `=C:=C:\dir`, and they must sort as the
+ * name "C:", not ahead of every letter), then up to the next '='. */
+static size_t env_name(const char *e, size_t *len) {
+  const char *p = e;
+  while (*p == '=') p++;
+  *len = strcspn(p, "=");
+  return (size_t)(p - e);
+}
+
+static bool env_same_name(const char *entry, const char *key) {
+  size_t n = 0;
+  const char *nm = entry + env_name(entry, &n);
+  size_t k = strlen(key);
+  if (k != n) return false;
+  for (size_t i = 0; i < n; i++) if (env_fold(nm[i]) != env_fold(key[i])) return false;
+  return true;
+}
+
+int sh_env_key_cmp(const char *x, const char *y) {
+  if (x == y) return 0;
+  if (!x) return -1;
+  if (!y) return 1;
+  size_t na = 0, nb = 0;
+  const char *a = x + env_name(x, &na), *b = y + env_name(y, &nb);
+  size_t n = na < nb ? na : nb;
+  for (size_t i = 0; i < n; i++) {
+    int d = env_fold(a[i]) - env_fold(b[i]);
+    if (d) return d;
+  }
+  if (na != nb) return na < nb ? -1 : 1;
+  /* names equal (possibly two spellings of one name): order by the whole entry so
+   * the result never depends on the order the block was assembled in */
+  for (const char *p = x, *q = y; ; p++, q++) {
+    int ca = env_fold(*p), cb = env_fold(*q);
+    if (ca != cb) return ca - cb;
+    if (!*p) return 0;
+  }
+}
+
+int sh_env_cmp_pp(const void *x, const void *y) {
+  return sh_env_key_cmp(*(char *const *)x, *(char *const *)y);
+}
+
+char *sh_env_block(Arena *a, char *const *base, const ShEnv *ovr, size_t *nbytes) {
+  if (nbytes) *nbytes = 0;
+  if (!a) return NULL;
+  int nb = 0;
+  if (base) while (base[nb]) nb++;
+  int no = (ovr && ovr->n > 0) ? ovr->n : 0;
+  if (!nb && !no) return NULL;               /* nothing to say: let the child inherit */
+  char **en = (char**)arena_zalloc(a, sizeof(char*) * (size_t)(nb + no + 1));
+  int n = 0;
+  for (int i = 0; i < nb; i++) en[n++] = arena_strdup(a, base[i]);
+  /* An override replaces the parent entry with the same (case-insensitive) name and
+   * keeps its OWN spelling -- Windows lookups ignore case anyway, and the caller's
+   * spelling is the one an agent typed. Order is fixed up by the sort below. */
+  for (int i = 0; i < no; i++) {
+    const char *k = ovr->p[i].k, *v = ovr->p[i].v;
+    if (!k || !*k) continue;                 /* an empty name is not a variable */
+    int hit = -1;
+    for (int j = 0; j < n; j++) if (env_same_name(en[j], k)) { hit = j; break; }
+    Str e = s_fmt(a, "%s=%s", k, v ? v : "");
+    if (hit >= 0) en[hit] = arena_strndup(a, e.p, (size_t)e.len);
+    else en[n++] = arena_strndup(a, e.p, (size_t)e.len);
+  }
+  qsort(en, (size_t)n, sizeof(char*), sh_env_cmp_pp);
+  size_t total = 1;                          /* the extra NUL that ends the block */
+  for (int i = 0; i < n; i++) total += strlen(en[i]) + 1;
+  char *blk = (char*)arena_zalloc(a, total + 1);
+  size_t o = 0;
+  for (int i = 0; i < n; i++) {
+    size_t l = strlen(en[i]);
+    memcpy(blk + o, en[i], l + 1);           /* each entry NUL-terminated */
+    o += l + 1;
+  }
+  blk[o++] = 0;                              /* ... plus one more: block terminator */
+  if (nbytes) *nbytes = o;
+  return blk;
+}
+
+char *const *sh_env_parent(void) {
+#ifdef _WIN32
+  return _environ ? (char *const *)_environ : NULL;
+#else
+  extern char **environ;
+  return environ ? (char *const *)environ : NULL;
+#endif
 }
 
 /* =====================================================================
@@ -779,12 +925,49 @@ static void clear_tmp(char paths[3][1024], const char *bat) {
   }
 }
 
+/* The one thing an ANSI environment block cannot carry is a byte sequence the
+ * system codepage does not accept: CreateProcessA converts it with CP_ACP, and a
+ * dangling multi-byte tail is not merely re-coded, it EATS the next byte -- which
+ * in a NUL-separated block means two entries merge into one and the child gets an
+ * environment nobody asked for. VXA's strings are UTF-8 bytes passed through
+ * unchanged (SPEC 9: no conversion), so on a non-UTF-8 codepage this is a real
+ * possibility. Refusing beats a silent corruption: the caller learns which name is
+ * at fault and can re-run with an ASCII value or a UTF-8 system codepage.
+ * Returns the offending name, or NULL when every pair converts. */
+static const char *env_unrepresentable(const ShEnv *env) {
+  if (!env) return NULL;
+  for (int i = 0; i < env->n; i++) {
+    const char *k = env->p[i].k, *v = env->p[i].v;
+    /* cchWideChar 0 = measure only; 0 then means the byte sequence itself is bad */
+    if (k && MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, k, -1, NULL, 0) == 0) return k;
+    if (v && MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, v, -1, NULL, 0) == 0) return k;
+  }
+  return NULL;
+}
+
 static bool win_run(Arena *a, const char *line, const char *cwd, const char *stdin_data,
-                    int timeout_ms, ShRes *r, char paths[3][1024], const char *bat) {
+                    size_t stdin_len, const ShEnv *env, int timeout_ms, ShRes *r,
+                    char paths[3][1024], const char *bat) {
   if (!a || !line || !*line) { res_fail(r, SH_SPAWN_FAIL, "no command line (arena unavailable)"); return false; }
+  const char *bad = env_unrepresentable(env);
+  if (bad) {
+    char msg[256];
+    snprintf(msg, sizeof msg,
+             "env name '%s' has a value that is not a valid byte sequence in the system "
+             "codepage (ACP %u); the child's block would be corrupt - use an ASCII value "
+             "or a UTF-8 codepage", bad ? bad : "?", (unsigned)GetACP());
+    clear_tmp(paths, bat);
+    res_fail(r, SH_SPAWN_FAIL, msg);
+    return false;
+  }
   /* stdin is always a file we control: an inherited console is how a command
    * waits forever for input nobody is going to type */
-  write_whole(paths[2], stdin_data ? stdin_data : "", stdin_data ? strlen(stdin_data) : 0);
+  write_whole(paths[2], stdin_data ? stdin_data : "", stdin_data ? stdin_len : 0);
+  /* The child's environment arrives as a block built for this one process.
+   * sh_env_parent()'s array is not modified and _putenv/setenv is never called,
+   * so nothing here is visible to the next command this script runs. */
+  size_t blk_n = 0;
+  char *blk = sh_env_block(a, sh_env_parent(), env, &blk_n);
 
   HANDLE ho = open_tmp(paths[0], GENERIC_WRITE, true, CREATE_ALWAYS);
   HANDLE he = open_tmp(paths[1], GENERIC_WRITE, true, CREATE_ALWAYS);
@@ -827,7 +1010,7 @@ static bool win_run(Arena *a, const char *line, const char *cwd, const char *std
   unsigned long long t0 = GetTickCount64();
   BOOL ok = CreateProcessA(NULL, mut, NULL, NULL, TRUE,
                            CREATE_SUSPENDED | CREATE_NO_WINDOW,
-                           NULL, (cwd && *cwd) ? cwd : NULL, &si, &pi);
+                           blk, (cwd && *cwd) ? cwd : NULL, &si, &pi);
   if (!ok) {
     DWORD gle = GetLastError();
     if (job) CloseHandle(job);
@@ -880,18 +1063,19 @@ static bool win_run(Arena *a, const char *line, const char *cwd, const char *std
 }
 
 bool sh_spawn_argv(Ctx *c, char *const *argv, int argc, const char *cwd,
-                   const char *stdin_data, int timeout_ms, ShRes *r) {
+                   const char *stdin_data, size_t stdin_len, const ShEnv *env,
+                   int timeout_ms, ShRes *r) {
   Arena *a = c ? ctx_arena(c) : NULL;
   if (!a) { res_fail(r, SH_SPAWN_FAIL, "no arena: cannot build the argv command line"); return false; }
   if (argc < 1 || !argv || !argv[0]) { res_fail(r, SH_SPAWN_FAIL, "empty command"); return false; }
   Str line = sh_command_line(a, argv, argc);
   char paths[3][1024];
   tmp_paths(c, paths, NULL);
-  return win_run(a, line.p, cwd, stdin_data, timeout_ms, r, paths, NULL);
+  return win_run(a, line.p, cwd, stdin_data, stdin_len, env, timeout_ms, r, paths, NULL);
 }
 
 bool sh_spawn_shell(Ctx *c, const char *cmd, const char *cwd, const char *stdin_data,
-                    int timeout_ms, ShRes *r) {
+                    size_t stdin_len, const ShEnv *env, int timeout_ms, ShRes *r) {
   Arena *a = c ? ctx_arena(c) : NULL;
   if (!a) { res_fail(r, SH_SPAWN_FAIL, "no arena: cannot build the shell command line"); return false; }
   char paths[3][1024];
@@ -921,7 +1105,7 @@ bool sh_spawn_shell(Ctx *c, const char *cmd, const char *cwd, const char *stdin_
     tmp_paths(c, paths, NULL);
     line = sh_shell_line(a, cmd);
   }
-  return win_run(a, line.p, cwd, stdin_data, timeout_ms, r, paths, bat);
+  return win_run(a, line.p, cwd, stdin_data, stdin_len, env, timeout_ms, r, paths, bat);
 }
 
 #else /* ------------------------- POSIX engine ------------------------- */
@@ -984,11 +1168,12 @@ static long mono_ms(void) {
 }
 
 static void posix_run(char *const *argv, int argc, const char *cmd, bool use_sh,
-                      const char *cwd, const char *stdin_data, int timeout_ms,
+                      const char *cwd, const char *stdin_data, size_t stdin_len,
+                      const ShEnv *env, int timeout_ms,
                       ShRes *r, char paths[3][1024]) {
   int wfd = open(paths[2], O_CREAT | O_TRUNC | O_WRONLY, 0600);
   if (wfd >= 0) {
-    if (stdin_data && *stdin_data) write_all_fd(wfd, stdin_data, strlen(stdin_data));
+    if (stdin_data && stdin_len) write_all_fd(wfd, stdin_data, stdin_len);
     close(wfd);
   }
   int ofd = open(paths[0], O_CREAT | O_TRUNC | O_WRONLY, 0600);
@@ -1016,6 +1201,17 @@ static void posix_run(char *const *argv, int argc, const char *cmd, bool use_sh,
     if (efd > 2) close(efd);
     setpgid(0, 0);
     if (cwd && *cwd && chdir(cwd) != 0) _exit(127);
+    /* execvpe semantics without an execvpe: the child already carries the parent's
+     * environment (it is a fork), so applying the overrides here is exactly what
+     * an envp-taking exec would do -- and this process replaces itself a moment
+     * later, so nothing set here can leak back into the script. */
+    if (env) {
+      for (int i = 0; i < env->n; i++) {
+        const char *k = env->p[i].k;
+        if (!k || !*k) continue;
+        setenv(k, env->p[i].v ? env->p[i].v : "", 1);
+      }
+    }
     if (use_sh) execl("/bin/sh", "sh", "-c", cmd ? cmd : "", (char*)NULL);
     else {
       char *av[SH_MAXARGS + 1];
@@ -1063,19 +1259,20 @@ static void posix_run(char *const *argv, int argc, const char *cmd, bool use_sh,
 }
 
 bool sh_spawn_argv(Ctx *c, char *const *argv, int argc, const char *cwd,
-                   const char *stdin_data, int timeout_ms, ShRes *r) {
+                   const char *stdin_data, size_t stdin_len, const ShEnv *env,
+                   int timeout_ms, ShRes *r) {
   if (argc < 1 || !argv || !argv[0]) { res_fail(r, SH_SPAWN_FAIL, "empty command"); return false; }
   char paths[3][1024];
   tmp_paths(c, paths, NULL);
-  posix_run(argv, argc, NULL, false, cwd, stdin_data, timeout_ms, r, paths);
+  posix_run(argv, argc, NULL, false, cwd, stdin_data, stdin_len, env, timeout_ms, r, paths);
   return true;
 }
 
 bool sh_spawn_shell(Ctx *c, const char *cmd, const char *cwd, const char *stdin_data,
-                    int timeout_ms, ShRes *r) {
+                    size_t stdin_len, const ShEnv *env, int timeout_ms, ShRes *r) {
   char paths[3][1024];
   tmp_paths(c, paths, NULL);
-  posix_run(NULL, 0, cmd, true, cwd, stdin_data, timeout_ms, r, paths);
+  posix_run(NULL, 0, cmd, true, cwd, stdin_data, stdin_len, env, timeout_ms, r, paths);
   return true;
 }
 
@@ -1084,17 +1281,19 @@ bool sh_spawn_shell(Ctx *c, const char *cmd, const char *cwd, const char *stdin_
 /* =====================================================================
  * 9. public entry
  * ===================================================================== */
-void sh_exec(Ctx *c, const char *cmd, const char *cwd, const char *stdin_data,
-             int timeout_ms, int tail_lines, bool redact, ShRes *r) {
+void sh_exec_env(Ctx *c, const char *cmd, const char *cwd, const char *stdin_data,
+                 size_t stdin_len, const ShEnv *env, int timeout_ms, int tail_lines,
+                 bool redact, ShRes *r) {
   if (!r) return;
   res_init(r);
+  if (stdin_len == 0 && stdin_data) stdin_len = strlen(stdin_data);
   if (timeout_ms <= 0) timeout_ms = SH_DEFAULT_TIMEOUT_MS;
   if (!cmd || !*cmd) { res_fail(r, SH_SPAWN_FAIL, "empty command"); return; }
   if (cwd && *cwd && !dir_exists(cwd)) { res_fail(r, SH_NO_CWD, "cwd not found"); return; }
 
   bool ran = false;
   if (sh_has_meta(cmd)) {
-    ran = sh_spawn_shell(c, cmd, cwd, stdin_data, timeout_ms, r);
+    ran = sh_spawn_shell(c, cmd, cwd, stdin_data, stdin_len, env, timeout_ms, r);
   } else {
     char stackbuf[2048], *sbuf = stackbuf, *heap = NULL;
     size_t need = strlen(cmd) + 1;
@@ -1112,9 +1311,16 @@ void sh_exec(Ctx *c, const char *cmd, const char *cwd, const char *stdin_data,
     } else if (argc == 0) {
       res_fail(r, SH_SPAWN_FAIL, "empty command");
     } else {
-      ran = sh_spawn_argv(c, argv, argc, cwd, stdin_data, timeout_ms, r);
+      ran = sh_spawn_argv(c, argv, argc, cwd, stdin_data, stdin_len, env, timeout_ms, r);
     }
     free(heap);
   }
   if (ran) finish(r, tail_lines, redact);
+}
+
+/* The pre-env/pre-length entry, unchanged in shape and meaning: a NUL-terminated
+ * stdin string and an inherited environment. */
+void sh_exec(Ctx *c, const char *cmd, const char *cwd, const char *stdin_data,
+             int timeout_ms, int tail_lines, bool redact, ShRes *r) {
+  sh_exec_env(c, cmd, cwd, stdin_data, 0, NULL, timeout_ms, tail_lines, redact, r);
 }
