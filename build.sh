@@ -45,8 +45,8 @@ deps() {
     lib_tx|lib_sh) echo $CORE src/lib_fs.c src/lib_tx.c src/lib_sh.c ;;
     lex)           echo tests/stubs.c src/util.c src/val.c src/lex.c src/parse.c ;;
     parse)         echo tests/stubs.c src/util.c src/val.c src/lex.c src/parse.c ;;
-    interp)        echo src/util.c src/val.c src/lex.c src/parse.c src/interp.c src/plan.c src/lib.c src/cfg.c src/fsx.c src/shell.c src/xdiff.c src/outline.c src/sim.c ;;
-    plan)          echo src/util.c src/val.c src/lex.c src/parse.c src/interp.c src/plan.c src/lib.c src/cfg.c src/fsx.c src/shell.c src/xdiff.c src/outline.c src/sim.c ;;
+    interp)        echo $CORE src/lib.c src/lib_core.c src/fsx.c src/shell.c src/xdiff.c src/outline.c src/sim.c src/lib_fs.c src/lib_tx.c src/lib_sh.c ;;
+    plan)          echo src/util.c src/val.c src/lex.c src/parse.c src/interp.c src/plan.c src/lib.c src/fsx.c src/shell.c src/xdiff.c src/outline.c src/sim.c ;;
     e2e)           echo ALL ;;
     *)             echo ALL ;;
   esac

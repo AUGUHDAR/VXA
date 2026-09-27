@@ -22,6 +22,8 @@ const char *ctx_root(Ctx *c);
 const char *ctx_script(Ctx *c);
 Arena *ctx_arena(Ctx *c);
 char *ctx_confirm(Ctx *c);
+void ctx_note_applied(Ctx *c, const char *token);  /* this ctx spent `token` on an apply */
+bool ctx_applied(Ctx *c, Str token);              /* did it, or was it replayed? */
 Str  ctx_argstr(Ctx *c);
 Rec *ctx_cfg(Ctx *c);
 long long ctx_steps(Ctx *c);

@@ -355,10 +355,12 @@ V plan_execute(Ctx *c, Plan *p, const char *given) {
   char tokz[16]; snprintf(tokz, sizeof tokz, "%.*s", tok.len, tok.p);
 
   /* 1. replay protection: a consumed token is never executed twice */
-  if (given && *given && journal_has_token(c, tokz))
+  if (given && *given && journal_has_token(c, tokz)) {
+    ctx_note_applied(c, tokz);        /* the receipt it produces answers .apply() */
     return v_ok(a, 5, "op", v_str(s_lit(a, p->op)), "token", v_str(s_lit(a, tokz)),
                 "applied", VF, "replayed", VT,
                 "note", v_str(s_lit(a, "token already consumed; the journal holds the record")));
+  }
 
   /* 2. decide whether a token is needed at all */
   bool wants = true;
@@ -426,6 +428,7 @@ V plan_execute(Ctx *c, Plan *p, const char *given) {
     return VN;
   }
   journal_note(c, "apply", tokz, plan_journal_detail(p).p);
+  ctx_note_applied(c, tokz);                    /* .apply() on this receipt is a no-op */
   if (res.t == V_REC) rec_set(a, res.u.r, s_wrap("token"), v_str(s_lit(a, tokz)));
   return res;
 }
@@ -593,7 +596,16 @@ Str plan_journal_detail(Plan *p) {
 }
 
 V op_apply(Ctx *c, V pv, V tokv) {
-  if (pv.t != V_PLAN) { set_error(c, E_TYPE, "apply needs a PLAN value"); return VN; }
+  if (pv.t != V_PLAN) {
+    /* The receipt of a plan this run already applied carries its spent token. Re-applying
+     * it returns the receipt unchanged - the effect already happened, and a second
+     * execution is not what an agent could ask for with a single-use token. */
+    V *t = pv.t == V_REC && pv.u.r ? rec_getz(pv.u.r, "token") : NULL;
+    if (t && t->t == V_STR && ctx_applied(c, t->u.s)) return pv;
+    set_error(c, E_TYPE, "apply needs a PLAN value, got %s%s", v_typename(pv),
+              v_is_err(pv) ? " - the call before it failed; check its .code first" : "");
+    return VN;
+  }
   /* an explicit token argument wins; otherwise --confirm on the command line
    * is the token (the agent cannot answer a prompt, so confirmation is a replay) */
   const char *tok = tokv.t == V_STR ? tokv.u.s.p : (ctx_confirm(c) ? ctx_confirm(c) : "");

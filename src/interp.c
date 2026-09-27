@@ -31,6 +31,7 @@ struct Ctx {
   Rec *cfg;
   Fmt fmt;
   bool strict, anchors;
+  Str *applied; int napplied, capplied;  /* tokens already spent by an apply in this ctx */
 };
 
 enum { F_NONE = 0, F_RETURN = 1, F_BREAK = 2, F_CONT = 3 };
@@ -68,6 +69,30 @@ Fmt ctx_fmt(Ctx *c) { return c->fmt; }
 void ctx_set_anchors(Ctx *c, bool on) { c->anchors = on; }
 bool ctx_anchors(Ctx *c) { return c->anchors; }
 Node *cur_node(Ctx *c) { return (Node*)c->node; }
+
+/* ---------- which tokens this context has already applied (SPEC 3.4b) --------
+ * plan.c notes every token it executes, and the evaluator reads that back to tell
+ * "the receipt of a plan that already ran" from a plain record. That is what makes
+ * `expr.apply()` and `p = expr; p.apply()` answer identically even for a builtin
+ * that consumed --confirm itself (sh.run does), where the second spelling used to
+ * die on a null function object with no name in the message. */
+void ctx_note_applied(Ctx *c, const char *token) {
+  if (!c || !token || !*token) return;
+  Str t = s_lit(c->a, token);
+  for (int i = 0; i < c->napplied; i++) if (s_eq(c->applied[i], t)) return;
+  if (c->napplied == c->capplied) {
+    int nc = c->capplied ? c->capplied * 2 : 8;
+    Str *nv = (Str*)arena_zalloc(c->a, sizeof(Str) * (size_t)nc);
+    for (int i = 0; i < c->napplied; i++) nv[i] = c->applied[i];
+    c->applied = nv; c->capplied = nc;
+  }
+  c->applied[c->napplied++] = t;
+}
+bool ctx_applied(Ctx *c, Str token) {
+  if (!c || !token.p || token.len <= 0) return false;
+  for (int i = 0; i < c->napplied; i++) if (s_eq(c->applied[i], token)) return true;
+  return false;
+}
 
 /* ---------- errors ---------- */
 void set_error(Ctx *c, ErrCode code, const char *fmt, ...) {
@@ -285,6 +310,34 @@ static V set_index(Ctx *c, Node *n, V self, V iv, V val) {
 
 typedef struct { V self; char name[48]; } Bound;
 
+/* A name that needs arguments is handed back as a callable bound to this receiver;
+ * call_fn refuses it on its own and the dot path in lib_call_value runs it. */
+static V bound_method(Ctx *c, V self, Str name) {
+  Bound *bd = (Bound*)arena_zalloc(c->a, sizeof(Bound));
+  bd->self = self;
+  snprintf(bd->name, sizeof bd->name, "%.*s", name.len, name.p);
+  Fn *f = (Fn*)arena_zalloc(c->a, sizeof(Fn));
+  f->kind = F_NATIVE; f->ud = bd; f->nparams = -1;
+  f->name = arena_strdup(c->a, bd->name);
+  f->native = NULL;
+  V r; r.t = V_FN; r.u.f = f; return r;
+}
+
+/* Does this plan carry a data field called `name`? The apply method is only
+ * reachable when it does not: data first, then method (SPEC 3.5). */
+static bool plan_has_field(Ctx *c, V plan, const char *name) {
+  Rec *r = rec_new(c->a);
+  plan_to_v(c, plan.u.pl, r);
+  return rec_getz(r, name) != NULL;
+}
+
+/* The token an applied plan puts on its receipt, or a null Str. */
+static Str receipt_token(V v) {
+  if (v.t != V_REC || !v.u.r) return s_null();
+  V *t = rec_getz(v.u.r, "token");
+  return (t && t->t == V_STR) ? t->u.s : s_null();
+}
+
 static V field_of(Ctx *c, Node *n, V self, Str name) {
   if (self.t == V_REC) {
     /* a record may legitimately own a key called "keys": the field wins.
@@ -292,13 +345,21 @@ static V field_of(Ctx *c, Node *n, V self, Str name) {
      * record's methods (SPEC 1.4), so r.keys works without hiding data. */
     V *p = rec_get(self.u.r, name);
     if (p) return *p;
+    /* No such key - and a missing key reads as null by design, so this is where
+     * the record's own methods and the ones every value answers get their turn:
+     * `{a:1}.type()` is SPEC 1.4, not a typo. */
     const Method *rm = meth_find("rec", name.p);
-    if (rm) return lib_method(c, self, name.p, NULL, 0);
+    if (!rm) rm = meth_find("any", name.p);
+    if (rm && rm->min == 0 && (rm->max == 0 || rm->max < 0))
+      return lib_method(c, self, name.p, NULL, 0);
+    if (rm) return bound_method(c, self, name);
     return VN;
   }
   if (self.t == V_PLAN) {
     /* a plan is addressable as data: p.token, p.files, p.op (SPEC 3.5 shows
-     * `if p.files.len > 5 { die }`, which only works if fields are readable) */
+     * `if p.files.len > 5 { die }`, which only works if fields are readable).
+     * This data read runs BEFORE the apply method everywhere, so a plan field named
+     * "apply" would be the field, never the method - the precedence is one rule. */
     Rec *r = rec_new(c->a);
     plan_to_v(c, self.u.pl, r);
     V *p = rec_get(r, name);
@@ -322,15 +383,9 @@ static V field_of(Ctx *c, Node *n, V self, Str name) {
     at_err(c, n, E_UNDEF, "%s has no method .%s - list them with: vxa doc %s", t, name.p, t);
     return VN;
   }
-  Bound *bd = (Bound*)arena_zalloc(c->a, sizeof(Bound));
-  bd->self = self;
-  snprintf(bd->name, sizeof bd->name, "%.*s", name.len, name.p);
-  Fn *f = (Fn*)arena_zalloc(c->a, sizeof(Fn));
-  f->kind = F_NATIVE; f->ud = bd; f->nparams = -1;
-  f->name = arena_strdup(c->a, bd->name);
-  f->native = NULL;
-  V r; r.t = V_FN; r.u.f = f; return r;
+  return bound_method(c, self, name);
 }
+
 
 
 static V set_field(Ctx *c, Node *n, V self, Str name, V val) {
@@ -413,7 +468,15 @@ V lib_call_value(Ctx *c, Node *call, V *args_pre, int nargs_pre, bool piped) {
     self = eval_node_impl(c, cn->kids[0], true);
     if (ctx_has_err(c)) return VN;
     have_self = true;
-    if (self.t == V_PLAN && !strcmp(cn->s.p, "apply")) {
+    /* PLAN.apply is one of the two ways a plan becomes a disk action (SPEC 3.4b),
+     * so it is routed here rather than by name lookup - but AFTER the plan's data
+     * fields (plan_has_field), so a field named "apply" still wins over the method.
+     * A record holding a token this ctx already applied answers it too, unchanged:
+     * that is what a builtin which spent --confirm itself (sh.run) hands back, and
+     * it is why the chained and the two-step spelling now take the same route. */
+    if (!strcmp(cn->s.p, "apply") &&
+        ((self.t == V_PLAN && !plan_has_field(c, self, "apply")) ||
+         (self.t == V_REC && !rec_getz(self.u.r, "apply") && ctx_applied(c, receipt_token(self))))) {
       if (!args) {
         args = (V*)arena_zalloc(c->a, sizeof(V) * (size_t)(call->nitems ? call->nitems : 1));
         for (int i = 0; i < call->nitems; i++) {
@@ -422,9 +485,15 @@ V lib_call_value(Ctx *c, Node *call, V *args_pre, int nargs_pre, bool piped) {
         }
         nargs = call->nitems;
       }
+      if (self.t == V_REC) return self;                   /* already applied: no re-run */
       return op_apply(c, self, nargs ? args[0] : VN);
     }
-    if (self.t != V_REC) {
+    /* A record's own key beats a method of the same name (`r.keys` is data when r
+     * owns "keys"); every other name is a method call, dispatched exactly the way
+     * every other type dispatches one. That includes the no-argument methods:
+     * asking field_of for `r.type()` would EVALUATE it and hand back "rec", which
+     * the call below would then try to call. */
+    if (self.t != V_REC || !rec_get(self.u.r, cn->s)) {
       if (!args) {
         args = (V*)arena_zalloc(c->a, sizeof(V) * (size_t)(call->nitems ? call->nitems : 1));
         for (int i = 0; i < call->nitems; i++) {

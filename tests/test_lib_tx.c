@@ -26,6 +26,8 @@
 #include <stdarg.h>
 #include <math.h>
 #include <stdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define WEAK __attribute__((weak))
 
@@ -425,6 +427,63 @@ static V kv1(const char *k, V v) {
   Rec *r = rec_new(&A);
   rec_set(&A, r, s_wrap(k), v);
   return rec_to_v(r);
+}
+
+/* ========== PLAN apply routing: the chained spelling vs. the two-step one =====
+ * What this pins (SPEC 3.4b/3.5): `expr.apply()` must take exactly the route
+ * `p = expr; p.apply()` takes, with --confirm present or absent, and a PLAN must
+ * stay readable as data on the way. It runs through the evaluator (parse_script +
+ * eval_node) because that routing IS the evaluator's job, and it runs inside
+ * build/tmp_apply_test/, which is also the jail root of PC - so the only files
+ * these assertions touch are scratch, and they are removed again below.
+ * PC is a second Ctx on purpose: the tx suite's C is rooted at "." and carries no
+ * policy, and an apply that writes must not be able to reach the repository. */
+static Ctx *PC = NULL;
+
+static V ap_ev(const char *src) {
+  V perr = VN;
+  ctx_clear_err(PC);
+  Node *p = parse_script(PC, src, strlen(src), "<chained>", &perr);
+  if (!p) {
+    V e = v_is_err(perr) ? perr : ctx_err(PC);
+    ctx_clear_err(PC);
+    return e;
+  }
+  V r = eval_node(PC, p);
+  if (ctx_has_err(PC)) { V e = ctx_err(PC); ctx_clear_err(PC); return e; }
+  return r;
+}
+static ErrCode ap_err(V r) {
+  ErrCode e = v_is_err(r) ? v_errcode(r) : (ctx_has_err(PC) ? v_errcode(ctx_err(PC)) : E_NONE);
+  ctx_clear_err(PC);
+  return e;
+}
+static const char *ap_msg(V r) {
+  V e = v_is_err(r) ? r : (ctx_has_err(PC) ? ctx_err(PC) : VN);
+  ctx_clear_err(PC);
+  if (!v_is_err(e) || !e.u.e) return "";
+  return arena_strndup(&A, e.u.e->msg.p, (size_t)(e.u.e->msg.len > 0 ? e.u.e->msg.len : 0));
+}
+static const char *ap_cstr(V v) {
+  if (v.t != V_STR) return NULL;
+  return arena_strndup(&A, v.u.s.p, (size_t)(v.u.s.len > 0 ? v.u.s.len : 0));
+}
+static bool ap_has(const char *p) { struct stat st; return stat(p, &st) == 0; }
+static bool ap_mk(const char *p, const char *body) {
+  FILE *f = fopen(p, "wb");
+  if (!f) return false;
+  fputs(body, f);
+  fclose(f);
+  return true;
+}
+static bool ap_body_is(const char *p, const char *want) {
+  FILE *f = fopen(p, "rb");
+  if (!f) return false;
+  char buf[256];
+  size_t n = fread(buf, 1, sizeof buf - 1, f);
+  fclose(f);
+  buf[n] = 0;
+  return !strcmp(buf, want);
 }
 
 int main(void) {
@@ -1530,6 +1589,248 @@ int main(void) {
               "tx.%s accepted %d args, min is %d", b->name, b->min - 1, b->min);
       clr();
     }
+  }
+
+  /* ================= chained apply vs two-step apply (SPEC 3.4b, 3.5) =======
+   * Regression: `sh.run(...).apply()` with --confirm died as "cannot call a
+   * null", because the builtin had already spent the token and handed back the
+   * receipt, and the evaluator then looked "apply" up among the receiver's data
+   * fields, found nothing, and called that. */
+  T("apply_scratch_jail");
+  char ap_back[4096];
+  ap_back[0] = 0;
+  {
+    if (!getcwd(ap_back, sizeof ap_back)) ap_back[0] = 0;
+    ensure_dir_for("build/tmp_apply_test/x");   /* fsx.c's mkdir -p, which also makes
+                                                  * the final component: drop it again. */
+    rmdir("build/tmp_apply_test/x");
+    int in = chdir("build/tmp_apply_test") == 0;
+    CHECK(in, "cannot chdir into build/tmp_apply_test");
+    char root[4096];
+    root[0] = 0;
+    CK(getcwd(root, sizeof root) != NULL && root[0] != 0);
+    PC = ctx_new(&A, root, "<chained>");
+    CK(PC != NULL);
+    if (PC) CK(ctx_root(PC)[0] != 0);
+  }
+
+  T("apply_chained_new_file");
+  if (PC) {
+    remove("chain-new.txt"); remove("step-new.txt");
+    V rc = ap_ev("fs.write(\"chain-new.txt\",\"from-chain\").apply()");
+    CK(!v_is_err(rc) && ap_err(rc) == E_NONE);
+    CK(rc.t == V_REC);
+    CK(ap_body_is("chain-new.txt", "from-chain"));
+    V rt = ap_ev("p = fs.write(\"step-new.txt\",\"from-step\"); p.apply()");
+    CK(!v_is_err(rt) && ap_err(rt) == E_NONE);
+    CK(ap_body_is("step-new.txt", "from-step"));
+    /* the two spellings answer the same shape, and the jail new-file plan
+     * auto-applied instead of stopping at NEED_CONFIRM (SPEC 3.3) */
+    Str tk = rf(rc, "token").u.s;
+    CK(rf(rc, "token").t == V_STR && tk.len == 12 && is_hex_lower(tk));
+    Str tk2 = rf(rt, "token").u.s;
+    CK(rf(rt, "token").t == V_STR && tk2.len == 12 && is_hex_lower(tk2));
+    CK(rf(rc, "bytes").t == V_NUM && rf(rc, "bytes").u.n == 10);
+    CK(rf(rt, "bytes").t == V_NUM && rf(rt, "bytes").u.n == 9);
+  }
+
+  T("apply_plan_fields_still_read");
+  if (PC) {
+    remove("d1.txt");
+    CK(eqs(ap_ev("p = fs.write(\"d1.txt\",\"abc\"); p.op"), "fs.write"));
+    CK(eqs(ap_ev("p = fs.write(\"d1.txt\",\"abc\"); p.confirm"), "jail"));
+    V cnt = ap_ev("fs.write(\"d2.txt\",\"abc\").count");
+    CK(cnt.t == V_NUM && cnt.u.n == 1);
+    V tok = ap_ev("fs.write(\"d3.txt\",\"abc\").token");
+    CK(tok.t == V_STR && tok.u.s.len == 12 && is_hex_lower(tok.u.s));   /* not a method value */
+    V fl = ap_ev("p = fs.write(\"d4.txt\",\"abcde\"); p.files.len");
+    CK(fl.t == V_NUM && fl.u.n == 1);             /* SPEC 3.5's p.files.len = #targets */
+    CK(eqs(ap_ev("p = fs.write(\"d5.txt\",\"abc\"); p.files[0].kind"), "create"));
+    CK(!ap_has("d1.txt") && !ap_has("d5.txt"));   /* reading a plan is not applying it */
+  }
+
+  T("apply_unknown_name_is_an_error");
+  if (PC) {
+    remove("u1.txt"); remove("u2.txt"); remove("u3.txt");
+    V a = ap_ev("p = fs.write(\"u1.txt\",\"x\"); p.bogus()");
+    CK(ap_err(a) == E_UNDEF);
+    V b = ap_ev("fs.write(\"u2.txt\",\"x\").bogus()");
+    CK(ap_err(b) == E_UNDEF);
+    CK(strstr(ap_msg(b), "no method") != NULL);
+    V c = ap_ev("fs.write(\"u3.txt\",\"x\").bogus");
+    CK(ap_err(c) == E_UNDEF);
+    CK(!ap_has("u1.txt") && !ap_has("u2.txt") && !ap_has("u3.txt"));
+  }
+
+  T("apply_is_never_implicit");
+  if (PC) {
+    remove("n1.txt"); remove("n2.txt");
+    V p = ap_ev("fs.write(\"n1.txt\",\"x\")");
+    CK(p.t == V_PLAN);
+    CK(!ap_has("n1.txt"));
+    V q = ap_ev("p = fs.write(\"n2.txt\",\"x\"); p");
+    CK(q.t == V_PLAN);
+    CK(!ap_has("n2.txt"));
+    /* a chained field read leaves the plan a plan: nothing was applied */
+    CK(eqs(ap_ev("sh.run(\"echo nothing-here\").type()"), "plan"));
+    CK(ap_err(ap_ev("sh.run(\"echo nothing-here\").apply()")) == E_NEED_CONFIRM);
+    CK(ap_err(ap_ev("p = sh.run(\"echo nothing-here\"); p.apply()")) == E_NEED_CONFIRM);
+  }
+
+  T("apply_chained_overwrite_with_confirm");
+  if (PC) {
+    CK(ap_mk("w1.txt", "old1")); CK(ap_mk("w2.txt", "old2")); CK(ap_mk("w3.txt", "old3"));
+    /* --confirm <token> is the CLI's way of handing the token to apply(): the
+     * chained and the two-step spelling must both act on it, once each. */
+    ctx_set_confirm(PC, "");
+    V t1 = ap_ev("p = fs.write(\"w1.txt\",\"new1\"); p.token");
+    CK(t1.t == V_STR);
+    ctx_set_confirm(PC, ap_cstr(t1));
+    V r1 = ap_ev("fs.write(\"w1.txt\",\"new1\").apply()");
+    CK(ap_err(r1) == E_NONE && r1.t == V_REC);
+    CK(ap_body_is("w1.txt", "new1"));
+    ctx_set_confirm(PC, "");
+    V t2 = ap_ev("p = fs.write(\"w2.txt\",\"new2\"); p.token");
+    ctx_set_confirm(PC, ap_cstr(t2));
+    V r2 = ap_ev("p = fs.write(\"w2.txt\",\"new2\"); p.apply()");
+    CK(ap_err(r2) == E_NONE && r2.t == V_REC);
+    CK(ap_body_is("w2.txt", "new2"));
+    /* a token for a different plan must not write, chained or not */
+    ctx_set_confirm(PC, "000000000000");
+    V r3 = ap_ev("fs.write(\"w3.txt\",\"never\").apply()");
+    CK(ap_err(r3) == E_BAD_TOKEN);
+    CK(ap_body_is("w3.txt", "old3"));
+    /* and with no token at all a chained apply is still gated: replacing an
+     * existing file is a confirm-worthy act, however the call is spelled */
+    CK(ap_mk("w4.txt", "old4"));
+    ctx_set_confirm(PC, "");
+    CK(ap_err(ap_ev("fs.write(\"w4.txt\",\"x\").apply()")) == E_NEED_CONFIRM);
+    CK(ap_body_is("w4.txt", "old4"));
+  }
+
+  T("apply_chained_every_mutating_builtin");
+  if (PC) {
+    /* "reached apply" has two proofs, and both spellings must give the same one:
+     * a jail new-file plan writes (SPEC 3.3), a confirm-worthy plan answers
+     * NEED_CONFIRM instead of calling a null. */
+    remove("m1.txt"); remove("m2.txt"); remove("m3.txt");
+    CK(ap_mk("m1.txt", "one\n"));
+    V ap = ap_ev("fs.append(\"m2.txt\",\"fresh\").apply()");
+    CK(ap_err(ap) == E_NONE && ap.t == V_REC);
+    CK(ap_body_is("m2.txt", "fresh"));
+    CK(ap_err(ap_ev("fs.append(\"m1.txt\",\"more\").apply()")) == E_NEED_CONFIRM);
+    CK(ap_err(ap_ev("p = fs.append(\"m1.txt\",\"more\"); p.apply()")) == E_NEED_CONFIRM);
+    CK(ap_err(ap_ev("fs.delete(\"m1.txt\").apply()")) == E_NEED_CONFIRM);
+    CK(ap_err(ap_ev("fs.move(\"m1.txt\",\"m3.txt\").apply()")) == E_NEED_CONFIRM);
+    ctx_set_confirm(PC, "");
+    V cf = ap_ev("cfg.save().apply()");
+    CK(ap_err(cf) == E_NONE && cf.t == V_REC);
+    CK(ap_has(".vxa/config.json"));
+    remove(".vxa/config.json");
+    /* one real cycle end to end, both halves chained and both confirmed: a delete
+     * that moved the file to the trash, and the restore that brought it back */
+    CK(ap_mk("r1.txt", "keep me"));
+    V dt = ap_ev("p = fs.delete(\"r1.txt\"); p.token");
+    ctx_set_confirm(PC, ap_cstr(dt));
+    V dr = ap_ev("fs.delete(\"r1.txt\").apply()");
+    CK(ap_err(dr) == E_NONE && dr.t == V_REC);
+    CK(!ap_has("r1.txt"));
+    V seq = rf(dr, "seq");
+    CK(seq.t == V_NUM);
+    if (seq.t == V_NUM) {
+      char pre[128];
+      ctx_set_confirm(PC, "");
+      snprintf(pre, sizeof pre, "p = fs.restore(%d); p.token", (int)seq.u.n);
+      V rt = ap_ev(pre);
+      ctx_set_confirm(PC, ap_cstr(rt));
+      snprintf(pre, sizeof pre, "fs.restore(%d).apply()", (int)seq.u.n);
+      V rr = ap_ev(pre);
+      CK(ap_err(rr) == E_NONE && rr.t == V_REC);
+      CK(ap_body_is("r1.txt", "keep me"));
+    }
+    ctx_set_confirm(PC, "");
+    remove("m1.txt"); remove("m2.txt"); remove("m3.txt"); remove("r1.txt");
+  }
+
+  T("apply_sh_run_receipt_is_idempotent");
+  if (PC) {
+    /* the reported repro, in-process: --confirm is spent by sh.run itself, so the
+     * receiver of .apply() is the receipt, not the plan */
+    ctx_set_confirm(PC, "");
+    V t = ap_ev("p = sh.run(\"echo chained-worked\"); p.token");
+    CK(t.t == V_STR);
+    ctx_set_confirm(PC, ap_cstr(t));
+    V r = ap_ev("sh.run(\"echo chained-worked\").apply()");
+    CK(ap_err(r) == E_NONE && r.t == V_REC);
+    const char *o1 = ap_cstr(rf(r, "out"));
+    CK(o1 && strstr(o1, "chained-worked") != NULL);
+    ctx_set_confirm(PC, "");
+    V t2 = ap_ev("p = sh.run(\"echo two-step-worked\"); p.token");
+    ctx_set_confirm(PC, ap_cstr(t2));
+    V r2 = ap_ev("p = sh.run(\"echo two-step-worked\"); p.apply()");
+    CK(ap_err(r2) == E_NONE && r2.t == V_REC);
+    const char *o2 = ap_cstr(rf(r2, "out"));
+    CK(o2 && strstr(o2, "two-step-worked") != NULL);
+    /* applying a receipt again is a no-op, never a second run of the command */
+    ctx_set_confirm(PC, "");
+    V t3 = ap_ev("p = sh.run(\"echo just-once\"); p.token");
+    ctx_set_confirm(PC, ap_cstr(t3));
+    V r3 = ap_ev("p = sh.run(\"echo just-once\"); q = p.apply(); q == p");
+    CK(ap_err(r3) == E_NONE && r3.t == V_BOOL && r3.u.b);
+    ctx_set_confirm(PC, "");
+    /* a record that is nobody's receipt has no .apply, and says which name it
+     * could not find instead of handing the call a null */
+    V b = ap_ev("r = {a:1}; r.apply()");
+    CK(ap_err(b) == E_UNDEF);
+    CK(strstr(ap_msg(b), "no method") != NULL);
+    /* the spent token is what makes a receipt apply-able, so a record that owns a
+     * field called "apply" still answers that field first (precedence, one rule) */
+    V tok = rf(r, "token");
+    CK(tok.t == V_STR);
+    const char *tkz = ap_cstr(tok);
+    CK(tkz != NULL);
+    if (tkz) {
+      char pre[512];
+      snprintf(pre, sizeof pre, "r = {token:\"%s\",apply:7}; r.apply", tkz);
+      V pf = ap_ev(pre);
+      CK(ap_err(pf) == E_NONE && pf.t == V_NUM && pf.u.n == 7);
+      snprintf(pre, sizeof pre, "r = {token:\"%s\",apply:7}; r.apply()", tkz);
+      V pc = ap_ev(pre);
+      CK(ap_err(pc) == E_TYPE);          /* the field won, and a 7 is not callable */
+    }
+  }
+
+  T("apply_rec_methods_reach_any");
+  if (PC) {
+    /* SPEC 1.4: every value answers .type() - on a record that used to fall off
+     * the end of field_of as a silent null. */
+    V v = ap_ev("r = {a:1}; r.type()");
+    CK(ap_err(v) == E_NONE && eqs(v, "rec"));
+    V j = ap_ev("r = {a:1}; r.json()");
+    CK(j.t == V_STR && j.u.s.len > 1 && j.u.s.p[0] == '{');
+    V g = ap_ev("r = {a:1}; r.get(\"a\", 0)");
+    CK(g.t == V_NUM && g.u.n == 1);
+    CK(ap_err(ap_ev("r = {a:1}; r.nope()")) == E_UNDEF);
+    V miss = ap_ev("r = {a:1}; r.nope");
+    CK(ap_err(miss) == E_NONE && miss.t == V_NULL);   /* a missing key still reads as null */
+  }
+
+  /* scratch cleanup: the journal/audit files the applies left behind are inside
+   * build/tmp_apply_test/.vxa/, so removing them takes the whole sandbox with it */
+  if (PC && ap_back[0]) {
+    remove("chain-new.txt"); remove("step-new.txt");
+    remove("w1.txt"); remove("w2.txt"); remove("w3.txt"); remove("w4.txt");
+    remove("n1.txt"); remove("n2.txt"); remove("d1.txt"); remove("d2.txt");
+    remove("d3.txt"); remove("d4.txt"); remove("d5.txt");
+    remove("u1.txt"); remove("u2.txt"); remove("u3.txt");
+    remove("m1.txt"); remove("m2.txt"); remove("m3.txt"); remove("r1.txt");
+    remove(".vxa/journal.ndjson"); remove(".vxa/audit.ndjson");
+    remove(".vxa/config.json"); remove(".vxa/trash/index.ndjson");
+    rmdir(".vxa/trash"); rmdir(".vxa/tmp"); rmdir(".vxa/cache");
+    rmdir(".vxa");
+    chdir(ap_back);
+    rmdir("build/tmp_apply_test");
+    CK(!ap_has("build/tmp_apply_test"));
   }
 
   T_REPORT("lib_tx");

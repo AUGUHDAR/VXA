@@ -97,9 +97,15 @@ outline、lib_fs、lib_tx、lib_sh 的测试脚手架仍在收尾（链接期 ma
 
 ## 已知缺陷（下一轮先修这个）
 
-- 链式 `sh.run(...).apply()` 带 `--confirm TOKEN` 时报 `cannot call a null`；
-  写成 `p = sh.run(...); p.apply()` 正常。根因在 V_PLAN 作为方法接收者的链式路径上，
-  `field_of` 先查计划字段失败、落到 call_fn 时函数值为空。需修并补一条链式用例。
+- 已修：链式 `sh.run(...).apply()` 带 `--confirm` 报 `cannot call a null`。
+  根因不在链式路径，而在 **`sh.run` 在内置函数内部就把 `--confirm` 花掉了**：`.apply()` 收到的是
+  回执 record 而非 PLAN，而 `apply` 只在 V_PLAN 上被拦截。我原先写的"两步写法正常"是错的，
+  实测两种写法同样失败；现在回执再 `.apply()` 返回自身，绝不二次执行。
+- 已修（我今早引入）：`{a:1}.type()` 等记录方法调用报 `cannot call a str`——我把"零参方法按属性求值"
+  做得太 eager，把调用路径上的方法也提前求值了。规则收紧为：属性优先取字段，方法其次。
+- 已修（本机正在生效的故障）：`.vxa/journal.ndjson` 被凌晨的旧代码建成了**目录**，导致
+  `fopen(...,"ab")` 静默失败——也就是一次性令牌台账在本机其实是空的，重放保护形同虚设。
+  清掉后已确认 `kind=apply` 回执正常入账。教训：静默失败的日志/台账必须有人盯着一查。
 
 ## 已知未完成 / 坑
 
