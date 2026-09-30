@@ -40,6 +40,7 @@ deps() {
     xdiff)         echo tests/stubs.c src/util.c src/val.c src/xdiff.c ;;
     sim)           echo tests/stubs.c src/util.c src/val.c src/sim.c ;;
     outline)       echo tests/stubs.c src/util.c src/val.c src/xdiff.c src/outline.c ;;
+    json)          echo src/util.c src/val.c src/json.c ;;
     sh|shell)      echo src/util.c src/val.c src/shell.c ;;
     lib_fs)        echo $CORE src/lib_fs.c src/lib_tx.c src/lib_sh.c ;;
     lib_tx|lib_sh) echo $CORE src/lib_fs.c src/lib_tx.c src/lib_sh.c ;;
@@ -52,7 +53,7 @@ deps() {
   esac
 }
 
-ALLSRC="src/util.c src/val.c src/lex.c src/parse.c src/interp.c src/plan.c src/lib.c src/lib_core.c src/lib_fs.c src/lib_tx.c src/lib_sh.c src/fsx.c src/shell.c src/xdiff.c src/outline.c src/sim.c src/main.c"
+ALLSRC="src/util.c src/val.c src/lex.c src/parse.c src/interp.c src/plan.c src/lib.c src/lib_core.c src/lib_fs.c src/lib_tx.c src/lib_sh.c src/json.c src/fsx.c src/shell.c src/xdiff.c src/outline.c src/sim.c src/main.c"
 
 link_srcs() {
   d=$(deps "$1")

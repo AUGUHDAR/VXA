@@ -5,6 +5,7 @@
 #include "vxa.h"
 #include "interp.h"
 #include "lib.h"
+#include "json.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,7 +18,7 @@ static void build(void) {
   if (g_all) return;
   int cap = 512, n = 0;
   Builtin *out = (Builtin*)malloc(sizeof(Builtin) * (size_t)cap);
-  static const Builtin* (*tabs[])(int*) = { t_fs, t_tx, t_sh, t_out, t_cfg, t_misc };
+  static const Builtin* (*tabs[])(int*) = { t_fs, t_tx, t_sh, t_out, t_cfg, t_misc, t_json };
   for (size_t k = 0; k < sizeof(tabs)/sizeof(tabs[0]); k++) {
     int m = 0;
     const Builtin *t = tabs[k](&m);
@@ -113,7 +114,7 @@ void doc_namespace(Arena *a, Buf *b, const char *ns, bool full) {
   }
   if (!bytes) {
     buf_fmt(b, "!ERR code=NOENT ns=%s hint=\"namespaces:", ns);
-    static const char *names[] = { "fs", "tx", "sh", "out", "cfg", "task", "misc" };
+    static const char *names[] = { "fs", "tx", "sh", "out", "cfg", "task", "json", "misc" };
     for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) buf_fmt(b, "%s%s", i ? "," : "", names[i]);
     buf_puts(b, "\"");
     return;
