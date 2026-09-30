@@ -95,6 +95,15 @@ outline、lib_fs、lib_tx、lib_sh 的测试脚手架仍在收尾（链接期 ma
 - `sh.run(argv, {env:{...}, stdin:"..."})`：环境变量合并注入（不改父进程）、stdin 喂入。
   令牌绑定 env 的**键+值哈希**与 stdin 的**长度+哈希**，明文不进计划、不进 journal、不进 audit。
 
+## 规约套件 `bash build.sh test spec`（512 断言 / 23 失败）
+
+这 23 条不是测试写坏，而是**规格承诺过、实现没做到**的地方，逐条对应 SPEC 小节：
+1. `null.type()` / `true.type()` / `false.type()` 失效 —— 字面量走 NK_ID 解析后未落入 any 类型方法路径。
+2. `r.code?` 不存在性判断语法（SPEC §1.5 与 §3.5 示例都用了它）—— 词法有 `T_QUEST`，语法层未实现该后缀。
+   要么实现 `?`，要么改文档统一用 `if r.code { }`；不能两头不一致。
+3. `for` 内 `break`/`continue` 未按 SPEC 生效。
+4. NEED_CONFIRM 作为值被捕获时的真值判定与 §3.5 示例不符。
+
 ## 已知缺陷（下一轮先修这个）
 
 - 已修：链式 `sh.run(...).apply()` 带 `--confirm` 报 `cannot call a null`。

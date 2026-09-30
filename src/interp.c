@@ -338,7 +338,64 @@ static Str receipt_token(V v) {
   return (t && t->t == V_STR) ? t->u.s : s_null();
 }
 
+/* SPEC 1.5: an ERR is a VALUE carrying code/msg/hint, and the documented idiom is
+ *   r = fs.read("nope.txt")        # -> !ERR code=NOENT
+ *   if r.code { ... }
+ * which needs two things: the name resolves against the error, and binding the
+ * error to a name takes responsibility for it (SPEC 1.5: an unused ERR is silent,
+ * only strict=1 stops at the first one). A builtin reports through the context, so
+ * without this release the assignment never even happened: the pending error cut
+ * the script short and `.code` was unreachable. SPEC 3.5 documents the same for
+ * `r = p.apply()`, which reports through the context and hands back nothing.
+ * A defect in the SCRIPT (SPEC 2.2 exit 2: parse, type, arity, undef, guard, die)
+ * stays fatal - catching it would hide the line the agent has to go and fix. */
+static bool err_catchable(Ctx *c, V v, bool *bind_pending) {
+  *bind_pending = false;
+  if (c->strict || !ctx_has_err(c)) return false;
+  if (err_exit(v_errcode(c->err)) == X_SCRIPT) return false;
+  if (v_is_err(v)) {
+    if (c->err.u.e != v.u.e) return false;      /* a different error: not this value's */
+    return true;
+  }
+  if (v.t != V_NULL) return false;              /* it produced a value; nothing to catch */
+  *bind_pending = true;                         /* the builtin failed by context, not by value */
+  return true;
+}
+
+/* The four names SPEC 1.5 gives an error value. `code` is the uppercase name
+ * because that is what the CLI prints (code=NOENT) and a non-empty string is
+ * truthy, which is what makes `if r.code` the test for "this is an error". */
+static bool err_field_name(const char *n) {
+  return n && (!strcmp(n, "code") || !strcmp(n, "msg") || !strcmp(n, "hint") || !strcmp(n, "data"));
+}
+
+static V err_field(Ctx *c, Node *n, V self, Str name) {
+  PErr *e = self.u.e;
+  if (s_eqz(name, "code")) return v_str(s_lit(c->a, err_name(e->code)));
+  if (s_eqz(name, "msg"))  return v_str(e->msg.p ? e->msg : s_lit(c->a, ""));
+  if (s_eqz(name, "hint")) return v_str(e->hint.p ? e->hint : s_lit(c->a, ""));
+  if (s_eqz(name, "data")) return e->data;
+  return VN;   /* not a field of an error: the caller falls to methods, then UNDEF */
+}
+
 static V field_of(Ctx *c, Node *n, V self, Str name) {
+  if (self.t == V_ERR) {
+    /* fields first, then the methods every value answers (.type(), .tostr()),
+     * then E_UNDEF - never a silent null (SPEC 1.4/1.5). */
+    if (err_field_name(name.p)) {
+      if (!self.u.e) { at_err(c, n, E_UNDEF, "err value carries no error data"); return VN; }
+      return err_field(c, n, self, name);
+    }
+    const Method *xm = meth_find("err", name.p);
+    if (!xm) xm = meth_find("any", name.p);
+    if (xm && xm->min == 0 && (xm->max == 0 || xm->max < 0))
+      return lib_method(c, self, name.p, NULL, 0);
+    if (xm) return bound_method(c, self, name);
+    at_err(c, n, E_UNDEF,
+      "err has no field '%s' - an error carries code,msg,hint,data (SPEC 1.5); "
+      "code reads as the uppercase name, e.g. NOENT", name.p);
+    return VN;
+  }
   if (self.t == V_REC) {
     /* a record may legitimately own a key called "keys": the field wins.
      * Only when there is no such field does the name fall through to the
@@ -622,6 +679,14 @@ static V ev_while(Ctx *c, Node *n) {
 static V ev_assign(Ctx *c, Node *n) {
   Node *t = n->kids[0];
   V v = ev(c, n->kids[1]);
+  bool pending = false;
+  if (t->k == NK_ID && err_catchable(c, v, &pending)) {
+    /* SPEC 1.5: bind the error and keep going; the agent checks it as data. */
+    V bind = pending ? c->err : v;
+    if (!env_assign(c->env, t->s.p, bind)) env_set(c->a, c->env, t->s.p, bind);
+    ctx_clear_err(c);
+    return bind;
+  }
   if (ctx_has_err(c)) return v;
   if (t->k == NK_ID) {
     const char *name = t->s.p;

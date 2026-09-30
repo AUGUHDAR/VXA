@@ -42,8 +42,11 @@ deps() {
     outline)       echo tests/stubs.c src/util.c src/val.c src/xdiff.c src/outline.c ;;
     json)          echo src/util.c src/val.c src/json.c ;;
     sh|shell)      echo src/util.c src/val.c src/shell.c ;;
-    lib_fs)        echo $CORE src/lib_fs.c src/lib_tx.c src/lib_sh.c ;;
-    lib_tx|lib_sh) echo $CORE src/lib_fs.c src/lib_tx.c src/lib_sh.c ;;
+    lib_fs)        echo $CORE src/lib_fs.c src/lib_tx.c src/lib_sh.c src/json.c ;;
+    lib_tx|lib_sh) echo $CORE src/lib_fs.c src/lib_tx.c src/lib_sh.c src/json.c ;;
+    # spec: the conformance suite runs SPEC.md's own examples through the real
+    # evaluator, so it needs the whole program except the CLI (main.c).
+    spec)          echo $CORE src/lib_fs.c src/lib_tx.c src/lib_sh.c src/json.c ;;
     lex)           echo tests/stubs.c src/util.c src/val.c src/lex.c src/parse.c ;;
     parse)         echo tests/stubs.c src/util.c src/val.c src/lex.c src/parse.c ;;
     interp)        echo $CORE src/lib.c src/lib_core.c src/fsx.c src/shell.c src/xdiff.c src/outline.c src/sim.c src/lib_fs.c src/lib_tx.c src/lib_sh.c ;;
